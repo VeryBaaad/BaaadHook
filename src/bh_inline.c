@@ -18,6 +18,7 @@ typedef struct bh_inline_record {
     uintptr_t target;
     void *target_argument;
     void *replacement;
+    void *mapping;
     void *trampoline;
     void *relay;
     uint8_t original_bytes[BH_INLINE_MAX_PATCH];
@@ -60,15 +61,14 @@ static bh_inline_record_t *bh_inline_find_active(uintptr_t target) {
     return NULL;
 }
 
-static bh_inline_record_t *bh_inline_find_any(uintptr_t target) {
-    bh_inline_record_t *record = bh_inline_records;
-    while (record != NULL) {
-        if (record->target == target) {
-            return record;
-        }
-        record = record->next;
+static void bh_inline_record_destroy(bh_inline_record_t *record) {
+    if (record == NULL) {
+        return;
     }
-    return NULL;
+    if (record->mapping != NULL) {
+        (void)bh__free_pages(record->mapping, record->mapping_size);
+    }
+    free(record);
 }
 
 static int bh_inline_overlaps(uintptr_t target, size_t patch_size) {
@@ -135,14 +135,23 @@ int bh_inline_hook(void *target_argument, void *replacement, void **original) {
     }
     code_capacity = mapping_size - arch.relay_size - 16u;
 
+    pthread_mutex_lock(&bh_inline_lock);
+    if (bh_inline_find_active(target) != NULL ||
+        bh_inline_overlaps(target, patch_size)) {
+        status = BH_INLINE_ERROR_ALREADY_HOOKED;
+        goto fail;
+    }
+
     if (bh__copy_code(original_bytes, (const void *)target_address,
                       sizeof(original_bytes)) != 0) {
-        return BH_INLINE_ERROR_MEMORY_PROTECTION;
+        status = BH_INLINE_ERROR_MEMORY_PROTECTION;
+        goto fail;
     }
 
     mapping = bh__alloc_near(target, mapping_size, arch.max_distance);
     if (mapping == NULL) {
-        return BH_INLINE_ERROR_OUT_OF_MEMORY;
+        status = BH_INLINE_ERROR_OUT_OF_MEMORY;
+        goto fail;
     }
 
     if (bh_arch_relocate(original_bytes, target_address, patch_size, thumb,
@@ -191,6 +200,7 @@ int bh_inline_hook(void *target_argument, void *replacement, void **original) {
     record->target = target;
     record->target_argument = target_argument;
     record->replacement = replacement;
+    record->mapping = mapping;
     record->trampoline = thumb ? (void *)((uintptr_t)mapping | 1u) : mapping;
     record->relay = relay;
     record->patch_size = patch_size;
@@ -200,21 +210,7 @@ int bh_inline_hook(void *target_argument, void *replacement, void **original) {
     record->active = 1;
     memcpy(record->original_bytes, original_bytes, patch_size);
 
-    pthread_mutex_lock(&bh_inline_lock);
-
-    if (bh_inline_find_active(target) != NULL) {
-        pthread_mutex_unlock(&bh_inline_lock);
-        status = BH_INLINE_ERROR_ALREADY_HOOKED;
-        goto fail;
-    }
-    if (bh_inline_overlaps(target, patch_size)) {
-        pthread_mutex_unlock(&bh_inline_lock);
-        status = BH_INLINE_ERROR_ALREADY_HOOKED;
-        goto fail;
-    }
-
     if (bh__write_code((void *)target_address, patch_bytes, patch_size) != 0) {
-        pthread_mutex_unlock(&bh_inline_lock);
         status = BH_INLINE_ERROR_MEMORY_PROTECTION;
         goto fail;
     }
@@ -232,6 +228,7 @@ int bh_inline_hook(void *target_argument, void *replacement, void **original) {
     return BH_INLINE_OK;
 
 fail:
+    pthread_mutex_unlock(&bh_inline_lock);
     if (record != NULL) {
         free(record);
     }
@@ -242,7 +239,8 @@ fail:
 }
 
 int bh_inline_unhook(void *target_argument) {
-    bh_inline_record_t *record;
+    bh_inline_record_t **link;
+    bh_inline_record_t *record = NULL;
     uintptr_t target;
     int result;
 
@@ -252,7 +250,14 @@ int bh_inline_unhook(void *target_argument) {
     target = bh_inline_normalize((uintptr_t)target_argument);
 
     pthread_mutex_lock(&bh_inline_lock);
-    record = bh_inline_find_active(target);
+    link = &bh_inline_records;
+    while (*link != NULL) {
+        if ((*link)->active && (*link)->target == target) {
+            record = *link;
+            break;
+        }
+        link = &(*link)->next;
+    }
     if (record == NULL) {
         pthread_mutex_unlock(&bh_inline_lock);
         return BH_INLINE_ERROR_NOT_HOOKED;
@@ -261,29 +266,49 @@ int bh_inline_unhook(void *target_argument) {
                             record->patch_size);
     if (result == 0) {
         record->active = 0;
+        *link = record->next;
+        record->next = NULL;
     }
     pthread_mutex_unlock(&bh_inline_lock);
 
-    return result == 0 ? BH_INLINE_OK : BH_INLINE_ERROR_MEMORY_PROTECTION;
+    if (result != 0) {
+        return BH_INLINE_ERROR_MEMORY_PROTECTION;
+    }
+    bh_inline_record_destroy(record);
+    return BH_INLINE_OK;
 }
 
 int bh_inline_unhook_all(void) {
-    bh_inline_record_t *record;
+    bh_inline_record_t **link;
+    bh_inline_record_t *retired = NULL;
     int count = 0;
 
     pthread_mutex_lock(&bh_inline_lock);
-    record = bh_inline_records;
-    while (record != NULL) {
+    link = &bh_inline_records;
+    while (*link != NULL) {
+        bh_inline_record_t *record = *link;
+
         if (record->active) {
             if (bh__write_code((void *)record->target, record->original_bytes,
-                               record->patch_size) == 0) {
-                record->active = 0;
-                count++;
+                               record->patch_size) != 0) {
+                link = &record->next;
+                continue;
             }
+            record->active = 0;
+            count++;
         }
-        record = record->next;
+
+        *link = record->next;
+        record->next = retired;
+        retired = record;
     }
     pthread_mutex_unlock(&bh_inline_lock);
+
+    while (retired != NULL) {
+        bh_inline_record_t *next = retired->next;
+        bh_inline_record_destroy(retired);
+        retired = next;
+    }
     return count;
 }
 
@@ -311,7 +336,7 @@ void *bh_inline_get_original(const void *target_argument) {
     }
     target = bh_inline_normalize((uintptr_t)target_argument);
     pthread_mutex_lock(&bh_inline_lock);
-    record = bh_inline_find_any(target);
+    record = bh_inline_find_active(target);
     if (record != NULL) {
         result = record->trampoline;
     }

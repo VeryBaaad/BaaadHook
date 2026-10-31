@@ -31,7 +31,7 @@ typedef struct bh_plt_record {
 
 typedef struct bh_plt_candidate {
     uintptr_t slot;
-    uintptr_t current_value;
+    void *resolved;
     char *image;
     char *symbol;
     int is_main;
@@ -128,9 +128,8 @@ static int bh_plt_image_matches(const char *requested, const char *path) {
 }
 
 static int bh_plt_add_candidate(bh_plt_collect_t *collect, uintptr_t slot,
-                                uintptr_t current_value, const char *image,
-                                const char *symbol, int is_main,
-                                int symbol_undefined) {
+                                const char *image, const char *symbol,
+                                int is_main, int symbol_undefined) {
     bh_plt_candidate_t *candidate;
     size_t i;
 
@@ -155,7 +154,6 @@ static int bh_plt_add_candidate(bh_plt_collect_t *collect, uintptr_t slot,
     candidate = &collect->items[collect->count];
     memset(candidate, 0, sizeof(*candidate));
     candidate->slot = slot;
-    candidate->current_value = current_value;
     candidate->image = strdup(image != NULL ? image : "");
     candidate->symbol = strdup(symbol != NULL ? symbol : "");
     candidate->is_main = is_main;
@@ -181,17 +179,22 @@ static uintptr_t bh_plt_normalize_dynamic_pointer(uintptr_t value,
     return value;
 }
 
-static const char *bh_plt_main_image_path(void) {
-    static char path[PATH_MAX];
-    if (path[0] == '\0') {
-        ssize_t length = readlink("/proc/self/exe", path, sizeof(path) - 1);
-        if (length > 0) {
-            path[length] = '\0';
-        } else {
-            path[0] = '\0';
-        }
+static char bh_plt_main_path[PATH_MAX];
+static pthread_once_t bh_plt_main_path_once = PTHREAD_ONCE_INIT;
+
+static void bh_plt_init_main_image_path(void) {
+    ssize_t length = readlink("/proc/self/exe", bh_plt_main_path,
+                              sizeof(bh_plt_main_path) - 1);
+    if (length > 0) {
+        bh_plt_main_path[length] = '\0';
+    } else {
+        bh_plt_main_path[0] = '\0';
     }
-    return path;
+}
+
+static const char *bh_plt_main_image_path(void) {
+    (void)pthread_once(&bh_plt_main_path_once, bh_plt_init_main_image_path);
+    return bh_plt_main_path;
 }
 
 static void bh_plt_scan_image(struct dl_phdr_info *info,
@@ -320,10 +323,8 @@ static void bh_plt_scan_image(struct dl_phdr_info *info,
             if (strcmp(name, collect->symbol) != 0) continue;
 
             slot = base + (uintptr_t)rel[i].r_offset;
-            if (bh_plt_add_candidate(
-                    collect, slot, bh__read_pointer((const void *)slot), image,
-                    name, is_main,
-                    symbol->st_shndx == SHN_UNDEF) != 0) {
+            if (bh_plt_add_candidate(collect, slot, image, name, is_main,
+                                     symbol->st_shndx == SHN_UNDEF) != 0) {
                 return;
             }
         }
@@ -351,10 +352,8 @@ static void bh_plt_scan_image(struct dl_phdr_info *info,
             if (strcmp(name, collect->symbol) != 0) continue;
 
             slot = base + (uintptr_t)rel[i].r_offset;
-            if (bh_plt_add_candidate(
-                    collect, slot, bh__read_pointer((const void *)slot), image,
-                    name, is_main,
-                    symbol->st_shndx == SHN_UNDEF) != 0) {
+            if (bh_plt_add_candidate(collect, slot, image, name, is_main,
+                                     symbol->st_shndx == SHN_UNDEF) != 0) {
                 return;
             }
         }
@@ -378,10 +377,8 @@ static void bh_plt_scan_image(struct dl_phdr_info *info,
             name = (const char *)(strtab + symbol->st_name);
             if (strcmp(name, collect->symbol) != 0) continue;
             slot = base + (uintptr_t)table[i].r_offset;
-            if (bh_plt_add_candidate(
-                    collect, slot, bh__read_pointer((const void *)slot), image,
-                    name, is_main,
-                    symbol->st_shndx == SHN_UNDEF) != 0) {
+            if (bh_plt_add_candidate(collect, slot, image, name, is_main,
+                                     symbol->st_shndx == SHN_UNDEF) != 0) {
                 return;
             }
         }
@@ -403,10 +400,8 @@ static void bh_plt_scan_image(struct dl_phdr_info *info,
             name = (const char *)(strtab + symbol->st_name);
             if (strcmp(name, collect->symbol) != 0) continue;
             slot = base + (uintptr_t)table[i].r_offset;
-            if (bh_plt_add_candidate(
-                    collect, slot, bh__read_pointer((const void *)slot), image,
-                    name, is_main,
-                    symbol->st_shndx == SHN_UNDEF) != 0) {
+            if (bh_plt_add_candidate(collect, slot, image, name, is_main,
+                                     symbol->st_shndx == SHN_UNDEF) != 0) {
                 return;
             }
         }
@@ -434,6 +429,14 @@ static bh_plt_record_t *bh_plt_find_slot(uintptr_t slot, int active_only) {
         record = record->next;
     }
     return NULL;
+}
+
+static int bh_plt_record_matches(const bh_plt_record_t *record,
+                                 const char *image_name, const char *symbol,
+                                 void *replacement) {
+    return record->active && strcmp(record->symbol, symbol) == 0 &&
+           bh_plt_image_matches(image_name, record->image) &&
+           (replacement == NULL || record->replacement == replacement);
 }
 
 static void *bh_plt_resolve_symbol(const char *image, const char *symbol,
@@ -475,13 +478,20 @@ static void bh_plt_free_candidates(bh_plt_collect_t *collect) {
     collect->count = 0;
 }
 
+static void bh_plt_record_destroy(bh_plt_record_t *record) {
+    if (record == NULL) {
+        return;
+    }
+    free(record->image);
+    free(record->symbol);
+    free(record);
+}
+
 static void bh_plt_rollback(bh_plt_record_t *records) {
     while (records != NULL) {
         bh_plt_record_t *next = records->next;
         (void)bh__write_pointer((void *)records->slot, records->saved_value);
-        free(records->image);
-        free(records->symbol);
-        free(records);
+        bh_plt_record_destroy(records);
         records = next;
     }
 }
@@ -503,25 +513,37 @@ int bh_plt_hook(const char *image_name, const char *symbol,
     collect.image = image_name;
     collect.symbol = symbol;
 
-    pthread_mutex_lock(&bh_plt_lock);
     (void)dl_iterate_phdr(bh_plt_collect_callback, &collect);
     if (collect.failed) {
-        pthread_mutex_unlock(&bh_plt_lock);
         bh_plt_free_candidates(&collect);
         return BH_PLT_ERROR_OUT_OF_MEMORY;
     }
     if (collect.count == 0) {
-        pthread_mutex_unlock(&bh_plt_lock);
         bh_plt_free_candidates(&collect);
         return BH_PLT_ERROR_NOT_FOUND;
     }
 
     for (i = 0; i < collect.count; i++) {
         bh_plt_candidate_t *candidate = &collect.items[i];
+        candidate->resolved = bh_plt_resolve_symbol(
+            candidate->image, symbol, candidate->is_main,
+            candidate->symbol_undefined);
+    }
+
+    pthread_mutex_lock(&bh_plt_lock);
+    for (i = 0; i < collect.count; i++) {
+        bh_plt_candidate_t *candidate = &collect.items[i];
         bh_plt_record_t *record;
         bh_plt_record_t *existing = bh_plt_find_slot(candidate->slot, 1);
-        void *resolved;
-        uintptr_t duplicate_value = candidate->slot;
+
+        for (record = new_records; record != NULL; record = record->next) {
+            if (record->slot == candidate->slot) {
+                break;
+            }
+        }
+        if (record != NULL) {
+            continue;
+        }
 
         if (existing != NULL) {
             if (existing->replacement == replacement) {
@@ -532,33 +554,21 @@ int bh_plt_hook(const char *image_name, const char *symbol,
             goto rollback;
         }
 
-        record = new_records;
-        while (record != NULL) {
-            if (record->slot == duplicate_value) break;
-            record = record->next;
-        }
-        if (record != NULL) {
-            continue;
-        }
-
-        resolved = bh_plt_resolve_symbol(candidate->image, symbol,
-                                         candidate->is_main,
-                                         candidate->symbol_undefined);
         record = (bh_plt_record_t *)calloc(1, sizeof(*record));
         if (record == NULL) {
             result = BH_PLT_ERROR_OUT_OF_MEMORY;
             goto rollback;
         }
         record->slot = candidate->slot;
-        record->saved_value = candidate->current_value;
+        record->saved_value = bh__read_pointer((const void *)candidate->slot);
         record->replacement = replacement;
-        record->resolved = resolved != NULL ? resolved : (void *)candidate->current_value;
+        record->resolved = candidate->resolved != NULL
+                               ? candidate->resolved
+                               : (void *)record->saved_value;
         record->image = strdup(candidate->image);
         record->symbol = strdup(symbol);
         if (record->image == NULL || record->symbol == NULL) {
-            free(record->image);
-            free(record->symbol);
-            free(record);
+            bh_plt_record_destroy(record);
             result = BH_PLT_ERROR_OUT_OF_MEMORY;
             goto rollback;
         }
@@ -566,9 +576,7 @@ int bh_plt_hook(const char *image_name, const char *symbol,
 
         if (bh__write_pointer((void *)candidate->slot,
                               (uintptr_t)replacement) != 0) {
-            free(record->image);
-            free(record->symbol);
-            free(record);
+            bh_plt_record_destroy(record);
             result = BH_PLT_ERROR_MEMORY_PROTECTION;
             goto rollback;
         }
@@ -582,12 +590,9 @@ int bh_plt_hook(const char *image_name, const char *symbol,
     }
 
     if (count == 0) {
-        if (first_original == NULL) {
-            pthread_mutex_unlock(&bh_plt_lock);
-            bh_plt_free_candidates(&collect);
-            return 0;
+        if (first_original != NULL && original != NULL) {
+            *original = first_original;
         }
-        if (original != NULL) *original = first_original;
         pthread_mutex_unlock(&bh_plt_lock);
         bh_plt_free_candidates(&collect);
         return 0;
@@ -605,15 +610,16 @@ int bh_plt_hook(const char *image_name, const char *symbol,
     return count;
 
 rollback:
-    pthread_mutex_unlock(&bh_plt_lock);
     bh_plt_rollback(new_records);
+    pthread_mutex_unlock(&bh_plt_lock);
     bh_plt_free_candidates(&collect);
     return result;
 }
 
 int bh_plt_unhook(const char *image_name, const char *symbol,
                   void *replacement) {
-    bh_plt_record_t *record;
+    bh_plt_record_t **link;
+    bh_plt_record_t *retired = NULL;
     int count = 0;
 
     if (symbol == NULL || symbol[0] == '\0') {
@@ -621,38 +627,61 @@ int bh_plt_unhook(const char *image_name, const char *symbol,
     }
 
     pthread_mutex_lock(&bh_plt_lock);
-    record = bh_plt_records;
-    while (record != NULL) {
-        if (record->active && strcmp(record->symbol, symbol) == 0 &&
-            bh_plt_image_matches(image_name, record->image) &&
-            (replacement == NULL || record->replacement == replacement)) {
-            if (bh__write_pointer((void *)record->slot, record->saved_value) == 0) {
-                record->active = 0;
-                count++;
-            }
+    link = &bh_plt_records;
+    while (*link != NULL) {
+        bh_plt_record_t *record = *link;
+
+        if (bh_plt_record_matches(record, image_name, symbol, replacement) &&
+            bh__write_pointer((void *)record->slot, record->saved_value) == 0) {
+            record->active = 0;
+            *link = record->next;
+            record->next = retired;
+            retired = record;
+            count++;
+            continue;
         }
-        record = record->next;
+        link = &record->next;
     }
     pthread_mutex_unlock(&bh_plt_lock);
+
+    while (retired != NULL) {
+        bh_plt_record_t *next = retired->next;
+        bh_plt_record_destroy(retired);
+        retired = next;
+    }
     return count;
 }
 
 int bh_plt_unhook_all(void) {
-    bh_plt_record_t *record;
+    bh_plt_record_t **link;
+    bh_plt_record_t *retired = NULL;
     int count = 0;
 
     pthread_mutex_lock(&bh_plt_lock);
-    record = bh_plt_records;
-    while (record != NULL) {
+    link = &bh_plt_records;
+    while (*link != NULL) {
+        bh_plt_record_t *record = *link;
+
         if (record->active) {
-            if (bh__write_pointer((void *)record->slot, record->saved_value) == 0) {
-                record->active = 0;
-                count++;
+            if (bh__write_pointer((void *)record->slot, record->saved_value) != 0) {
+                link = &record->next;
+                continue;
             }
+            record->active = 0;
+            count++;
         }
-        record = record->next;
+
+        *link = record->next;
+        record->next = retired;
+        retired = record;
     }
     pthread_mutex_unlock(&bh_plt_lock);
+
+    while (retired != NULL) {
+        bh_plt_record_t *next = retired->next;
+        bh_plt_record_destroy(retired);
+        retired = next;
+    }
     return count;
 }
 
@@ -667,9 +696,7 @@ int bh_plt_is_hooked(const char *image_name, const char *symbol,
     pthread_mutex_lock(&bh_plt_lock);
     record = bh_plt_records;
     while (record != NULL) {
-        if (record->active && strcmp(record->symbol, symbol) == 0 &&
-            bh_plt_image_matches(image_name, record->image) &&
-            (replacement == NULL || record->replacement == replacement)) {
+        if (bh_plt_record_matches(record, image_name, symbol, replacement)) {
             found = 1;
             break;
         }

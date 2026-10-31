@@ -57,6 +57,18 @@ int main(void) {
     CHECK(bh_plt_is_hooked(NULL, "puts", (void *)bh_fake_puts) == 0);
 
     {
+        int cycle;
+        for (cycle = 0; cycle < 32; cycle++) {
+            original = NULL;
+            count = bh_plt_hook(NULL, "puts", (void *)bh_fake_puts, &original);
+            CHECK(count >= 1);
+            CHECK(original != NULL);
+            CHECK(bh_plt_unhook(NULL, "puts", (void *)bh_fake_puts) >= 1);
+            CHECK(bh_plt_is_hooked(NULL, "puts", (void *)bh_fake_puts) == 0);
+        }
+    }
+
+    {
         char executable[4096];
         ssize_t length = readlink("/proc/self/exe", executable,
                                   sizeof(executable) - 1);

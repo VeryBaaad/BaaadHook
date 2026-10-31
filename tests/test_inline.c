@@ -69,12 +69,22 @@ int main(void) {
           BH_INLINE_ERROR_ALREADY_HOOKED);
     CHECK(bh_inline_unhook((void *)bh_test_add) == BH_INLINE_OK);
     CHECK(bh_test_add(2, 3) == 5);
+    CHECK(bh_inline_get_original((void *)bh_test_add) == NULL);
+    {
+        int cycle;
+        for (cycle = 0; cycle < 32; cycle++) {
+            CHECK(bh_inline_hook((void *)bh_test_add, (void *)bh_hook_add,
+                                 NULL) == BH_INLINE_OK);
+            CHECK(bh_inline_unhook((void *)bh_test_add) == BH_INLINE_OK);
+        }
+    }
     CHECK(bh_inline_hook((void *)bh_test_add, (void *)bh_hook_add, &original) ==
           BH_INLINE_OK);
     bh_orig_add = (int (*)(int, int))original;
     CHECK(bh_test_add(4, 5) == 109);
     CHECK(bh_inline_unhook_all() >= 1);
     CHECK(bh_test_add(1, 1) == 2);
+    CHECK(bh_inline_unhook((void *)bh_test_add) == BH_INLINE_ERROR_NOT_HOOKED);
 
     original = NULL;
     result = bh_inline_hook((void *)bh_test_read_global, (void *)bh_hook_global,

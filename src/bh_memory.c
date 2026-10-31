@@ -89,11 +89,13 @@ static const bh_map_entry_t *bh__find_map(const bh_map_entry_t *maps, size_t cou
 
 size_t bh__page_size(void) {
     static size_t cached = 0;
-    if (cached == 0) {
-        long value = sysconf(_SC_PAGESIZE);
-        cached = value > 0 ? (size_t)value : 4096u;
+    size_t value = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+    if (value == 0) {
+        long queried = sysconf(_SC_PAGESIZE);
+        value = queried > 0 ? (size_t)queried : 4096u;
+        __atomic_store_n(&cached, value, __ATOMIC_RELEASE);
     }
-    return cached;
+    return value;
 }
 
 int bh__protect_query(uintptr_t address, int *prot) {
@@ -224,6 +226,16 @@ int bh__copy_code(void *dst, const void *src, size_t size) {
     return 0;
 }
 
+static void bh__restore_page_protections(uintptr_t first_page, size_t page_size,
+                                         size_t page_count,
+                                         const int *saved_prot) {
+    size_t i;
+    for (i = 0; i < page_count; i++) {
+        (void)mprotect((void *)(first_page + i * page_size), page_size,
+                       saved_prot[i]);
+    }
+}
+
 int bh__write_code(void *dst, const void *src, size_t size) {
     uint8_t *destination = (uint8_t *)dst;
     const uint8_t *source = (const uint8_t *)src;
@@ -252,15 +264,12 @@ int bh__write_code(void *dst, const void *src, size_t size) {
         uintptr_t page = first_page + i * page_size;
         int prot = 0;
         if (bh__protect_query(page, &prot) != 0) {
+            bh__restore_page_protections(first_page, page_size, i, saved_prot);
             goto cleanup;
         }
         saved_prot[i] = prot;
         if (mprotect((void *)page, page_size, prot | PROT_READ | PROT_WRITE) != 0) {
-            size_t j;
-            for (j = 0; j < i; j++) {
-                (void)mprotect((void *)(first_page + j * page_size), page_size,
-                               saved_prot[j]);
-            }
+            bh__restore_page_protections(first_page, page_size, i, saved_prot);
             goto cleanup;
         }
     }
@@ -268,10 +277,7 @@ int bh__write_code(void *dst, const void *src, size_t size) {
     memcpy(destination, source, size);
     bh__flush_cache(dst, size);
 
-    for (i = 0; i < page_count; i++) {
-        uintptr_t page = first_page + i * page_size;
-        (void)mprotect((void *)page, page_size, saved_prot[i]);
-    }
+    bh__restore_page_protections(first_page, page_size, page_count, saved_prot);
     result = 0;
 
 cleanup:
@@ -331,8 +337,24 @@ typedef struct bh_gap {
     uintptr_t distance;
 } bh_gap_t;
 
-static uintptr_t bh__distance(uintptr_t a, uintptr_t b) {
-    return a > b ? a - b : b - a;
+static uintptr_t bh__align_up_ptr(uintptr_t value, size_t alignment) {
+    uintptr_t mask = (uintptr_t)alignment - 1u;
+    if (value > UINTPTR_MAX - mask) {
+        return UINTPTR_MAX & ~mask;
+    }
+    return (value + mask) & ~mask;
+}
+
+static int bh__mapping_within_distance(uintptr_t address, uintptr_t target,
+                                       size_t allocation_size,
+                                       size_t max_distance) {
+    if (address >= target) {
+        if (max_distance < allocation_size) {
+            return 0;
+        }
+        return address - target <= max_distance - allocation_size;
+    }
+    return target - address <= max_distance;
 }
 
 static int bh__gap_compare(const void *lhs, const void *rhs) {
@@ -360,7 +382,16 @@ void *bh__alloc_near(uintptr_t target, size_t size, size_t max_distance) {
     }
 
     page_size = bh__page_size();
+    if (page_size == 0 || (page_size & (page_size - 1u)) != 0) {
+        return NULL;
+    }
+    if (size > SIZE_MAX - (page_size - 1u)) {
+        return NULL;
+    }
     allocation_size = bh__align_up(size, page_size);
+    if (allocation_size == 0) {
+        return NULL;
+    }
     if (bh__parse_maps(&maps, &map_count) != 0 || map_count == 0) {
         free(maps);
         return NULL;
@@ -381,6 +412,8 @@ void *bh__alloc_near(uintptr_t target, size_t size, size_t max_distance) {
     for (i = 0; i <= map_count; i++) {
         uintptr_t gap_start;
         uintptr_t gap_end;
+        uintptr_t aligned_start;
+        uintptr_t aligned_end;
 
         if (i == 0) {
             gap_start = low_limit;
@@ -402,54 +435,55 @@ void *bh__alloc_near(uintptr_t target, size_t size, size_t max_distance) {
         if (gap_start < low_limit) {
             gap_start = low_limit;
         }
-        if (gap_end <= gap_start || gap_end - gap_start < allocation_size) {
+        if (gap_end <= gap_start) {
             continue;
         }
-        if (gap_start < page_size) {
-            gap_start = page_size;
+
+        aligned_start = bh__align_up_ptr(gap_start, page_size);
+        aligned_end = bh__align_down_ptr(gap_end, page_size);
+        if (aligned_start < page_size) {
+            aligned_start = page_size;
+        }
+        if (aligned_end <= aligned_start ||
+            aligned_end - aligned_start < allocation_size) {
+            continue;
         }
 
-        gaps[gap_count].start = gap_start;
-        gaps[gap_count].end = gap_end;
-        if (target < gap_start) {
-            gaps[gap_count].distance = gap_start - target;
-        } else if (target >= gap_end) {
-            gaps[gap_count].distance = target - gap_end;
+        gaps[gap_count].start = aligned_start;
+        gaps[gap_count].end = aligned_end;
+        if (target < aligned_start) {
+            gaps[gap_count].distance = aligned_start - target;
+        } else if (target >= aligned_end) {
+            gaps[gap_count].distance = target - aligned_end;
         } else {
             gaps[gap_count].distance = 0;
         }
         gap_count++;
     }
 
-    qsort(gaps, gap_count, sizeof(bh_gap_t), bh__gap_compare);
+    if (gap_count > 1) {
+        qsort(gaps, gap_count, sizeof(bh_gap_t), bh__gap_compare);
+    }
 
     for (i = 0; i < gap_count && i < 64; i++) {
         uintptr_t gap_start = gaps[i].start;
         uintptr_t gap_end = gaps[i].end;
+        uintptr_t last_start = gap_end - allocation_size;
         uintptr_t hint;
+        uintptr_t address;
 
         if (target < gap_start) {
             hint = gap_start;
         } else if (target >= gap_end) {
-            hint = gap_end - allocation_size;
+            hint = last_start;
         } else {
-            hint = target;
-        }
-        hint = bh__align_down_ptr(hint, page_size);
-        if (hint < gap_start) {
-            hint = gap_start;
-        }
-        if (hint > UINTPTR_MAX - allocation_size) {
-            continue;
-        }
-        if (hint + allocation_size > gap_end) {
-            if (gap_end < allocation_size) {
-                continue;
+            hint = bh__align_down_ptr(target, page_size);
+            if (hint < gap_start) {
+                hint = gap_start;
             }
-            hint = bh__align_down_ptr(gap_end - allocation_size, page_size);
-        }
-        if (hint < page_size) {
-            continue;
+            if (hint > last_start) {
+                hint = last_start;
+            }
         }
 
         result = mmap((void *)hint, allocation_size, PROT_READ | PROT_WRITE,
@@ -458,8 +492,12 @@ void *bh__alloc_near(uintptr_t target, size_t size, size_t max_distance) {
             result = NULL;
             continue;
         }
-        if (bh__distance((uintptr_t)result, target) >
-            (max_distance > allocation_size ? max_distance - allocation_size : 0)) {
+
+        address = (uintptr_t)result;
+        if (address < gap_start || address > last_start ||
+            (address & (uintptr_t)(page_size - 1u)) != 0 ||
+            !bh__mapping_within_distance(address, target, allocation_size,
+                                         max_distance)) {
             (void)munmap(result, allocation_size);
             result = NULL;
             continue;
@@ -471,8 +509,10 @@ void *bh__alloc_near(uintptr_t target, size_t size, size_t max_distance) {
         result = mmap(NULL, allocation_size, PROT_READ | PROT_WRITE,
                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (result != MAP_FAILED) {
-            if (bh__distance((uintptr_t)result, target) >
-                (max_distance > allocation_size ? max_distance - allocation_size : 0)) {
+            uintptr_t address = (uintptr_t)result;
+            if ((address & (uintptr_t)(page_size - 1u)) != 0 ||
+                !bh__mapping_within_distance(address, target, allocation_size,
+                                             max_distance)) {
                 (void)munmap(result, allocation_size);
                 result = NULL;
             }

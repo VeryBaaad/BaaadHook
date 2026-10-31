@@ -11,6 +11,17 @@ target_link_libraries(bh_plt_test PRIVATE baaadhook)
 target_compile_options(bh_plt_test PRIVATE -O0 -fno-omit-frame-pointer)
 add_test(NAME bh_plt_test COMMAND bh_plt_test)
 
+add_executable(bh_memory_test test_memory.c)
+target_link_libraries(bh_memory_test PRIVATE baaadhook)
+target_include_directories(bh_memory_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_compile_options(bh_memory_test PRIVATE -O0 -fno-omit-frame-pointer)
+add_test(NAME bh_memory_test COMMAND bh_memory_test)
+
+add_executable(bh_concurrent_test test_concurrent.c)
+target_link_libraries(bh_concurrent_test PRIVATE baaadhook)
+target_compile_options(bh_concurrent_test PRIVATE -O0 -fno-omit-frame-pointer)
+add_test(NAME bh_concurrent_test COMMAND bh_concurrent_test)
+
 if(NOT ANDROID AND CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
    CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     add_executable(bh_plt_nopie_test test_plt.c)
