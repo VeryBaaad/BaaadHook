@@ -7,7 +7,9 @@
 
 #include "bh_internal.h"
 
+#include <elf.h>
 #include <errno.h>
+#include <link.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,6 +18,16 @@
 
 #ifndef MAP_ANONYMOUS
 #  define MAP_ANONYMOUS MAP_ANON
+#endif
+
+#if defined(__aarch64__)
+#  define BH_PROT_BTI 0x10
+#  ifndef PT_GNU_PROPERTY
+#    define PT_GNU_PROPERTY 0x6474e553
+#  endif
+#  ifndef NT_GNU_PROPERTY_TYPE_0
+#    define NT_GNU_PROPERTY_TYPE_0 5
+#  endif
 #endif
 
 typedef struct bh_map_entry {
@@ -85,6 +97,232 @@ static const bh_map_entry_t *bh__find_map(const bh_map_entry_t *maps, size_t cou
         }
     }
     return NULL;
+}
+
+#if defined(__aarch64__)
+
+typedef struct bh_gnu_property {
+    uint32_t pr_type;
+    uint32_t pr_datasz;
+} bh_gnu_property_t;
+
+typedef struct bh_bti_query {
+    uintptr_t address;
+    int found;
+} bh_bti_query_t;
+
+static int bh__gnu_note_has_bti(uintptr_t note, size_t size) {
+    uintptr_t cursor = note;
+    uintptr_t end = note + size;
+
+    if (end < note) {
+        return 0;
+    }
+    while (cursor + sizeof(ElfW(Nhdr)) <= end) {
+        const ElfW(Nhdr) *header = (const ElfW(Nhdr) *)cursor;
+        size_t namesz = header->n_namesz;
+        size_t descsz = header->n_descsz;
+        uintptr_t name = cursor + sizeof(*header);
+        uintptr_t desc = name + ((namesz + 3u) & ~(size_t)3u);
+        uintptr_t next = desc + ((descsz + 3u) & ~(size_t)3u);
+
+        if (next <= cursor || next > end) {
+            break;
+        }
+        if (header->n_type == NT_GNU_PROPERTY_TYPE_0 && namesz >= 3 &&
+            memcmp((const void *)name, "GNU", 3) == 0) {
+            uintptr_t prop = desc;
+            uintptr_t prop_end = desc + descsz;
+
+            while (prop + sizeof(bh_gnu_property_t) <= prop_end) {
+                const bh_gnu_property_t *entry =
+                    (const bh_gnu_property_t *)prop;
+                size_t datasz = entry->pr_datasz;
+                size_t align = sizeof(uintptr_t);
+                uintptr_t data = prop + sizeof(*entry);
+                uintptr_t next_prop =
+                    data + ((datasz + align - 1u) & ~(align - 1u));
+
+                if (next_prop <= prop || next_prop > prop_end) {
+                    break;
+                }
+                if (entry->pr_type == 0xc0000000u && datasz >= 4) {
+                    uint32_t flags = 0;
+                    memcpy(&flags, (const void *)data, sizeof(flags));
+                    if ((flags & 1u) != 0) {
+                        return 1;
+                    }
+                }
+                prop = next_prop;
+            }
+        }
+        cursor = next;
+    }
+    return 0;
+}
+
+static int bh__bti_query_callback(struct dl_phdr_info *info, size_t size,
+                                  void *data) {
+    bh_bti_query_t *query = (bh_bti_query_t *)data;
+    uintptr_t base = (uintptr_t)info->dlpi_addr;
+    size_t i;
+    int in_executable = 0;
+
+    (void)size;
+    for (i = 0; i < info->dlpi_phnum; i++) {
+        const ElfW(Phdr) *phdr = &info->dlpi_phdr[i];
+        uintptr_t start;
+        uintptr_t end;
+
+        if (phdr->p_type != PT_LOAD || (phdr->p_flags & PF_X) == 0) {
+            continue;
+        }
+        start = base + (uintptr_t)phdr->p_vaddr;
+        if (start < base) {
+            continue;
+        }
+        end = start + (uintptr_t)phdr->p_memsz;
+        if (end < start) {
+            continue;
+        }
+        if (query->address >= start && query->address < end) {
+            in_executable = 1;
+            break;
+        }
+    }
+    if (!in_executable) {
+        return 0;
+    }
+    for (i = 0; i < info->dlpi_phnum; i++) {
+        const ElfW(Phdr) *phdr = &info->dlpi_phdr[i];
+        uintptr_t note;
+        size_t note_size;
+
+        if (phdr->p_type != PT_GNU_PROPERTY) {
+            continue;
+        }
+        note = base + (uintptr_t)phdr->p_vaddr;
+        note_size = (size_t)phdr->p_memsz;
+        if (bh__gnu_note_has_bti(note, note_size)) {
+            query->found = 1;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+#  define BH_SMAPS_LINE_SIZE 512
+#  define BH_SMAPS_MAX_TOKENS 64
+#  define BH_SMAPS_MAX_LINES 262144
+
+static int bh__smaps_has_bti(uintptr_t address) {
+    FILE *fp;
+    char line[BH_SMAPS_LINE_SIZE];
+    int in_mapping = 0;
+    int result = 0;
+    size_t lines = 0;
+
+    if (address == 0) {
+        return 0;
+    }
+    fp = fopen("/proc/self/smaps", "r");
+    if (fp == NULL) {
+        return 0;
+    }
+
+    while (lines < BH_SMAPS_MAX_LINES && fgets(line, sizeof(line), fp) != NULL) {
+        unsigned long start = 0;
+        unsigned long end = 0;
+        char perms[8] = {0};
+
+        lines++;
+        if (sscanf(line, "%lx-%lx %7s", &start, &end, perms) == 3 &&
+            end > start) {
+            if (in_mapping) {
+                break;
+            }
+            if (address >= (uintptr_t)start && address < (uintptr_t)end) {
+                in_mapping = 1;
+            }
+            continue;
+        }
+        if (!in_mapping || strncmp(line, "VmFlags:", 8) != 0) {
+            continue;
+        }
+        {
+            char *save = NULL;
+            char *token;
+            size_t tokens = 0;
+
+            for (token = strtok_r(line + 8, " \t\r\n", &save);
+                 token != NULL && tokens < BH_SMAPS_MAX_TOKENS;
+                 token = strtok_r(NULL, " \t\r\n", &save)) {
+                tokens++;
+                if (strcmp(token, "bt") == 0) {
+                    result = 1;
+                    break;
+                }
+            }
+        }
+        break;
+    }
+
+    fclose(fp);
+    return result;
+}
+
+int bh__page_has_bti(uintptr_t address) {
+    bh_bti_query_t query;
+
+    query.address = address;
+    query.found = 0;
+    (void)dl_iterate_phdr(bh__bti_query_callback, &query);
+    if (query.found) {
+        return 1;
+    }
+    return bh__smaps_has_bti(address);
+}
+
+static int bh__bti_enabled(void) {
+    static int cached = -1;
+    int value = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+
+    if (value < 0) {
+        size_t page_size = bh__page_size();
+        void *probe = mmap(NULL, page_size, PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+        if (probe != MAP_FAILED) {
+            value = mprotect(probe, page_size,
+                             PROT_READ | PROT_EXEC | BH_PROT_BTI) == 0;
+            (void)munmap(probe, page_size);
+        } else {
+            value = 0;
+        }
+        __atomic_store_n(&cached, value, __ATOMIC_RELEASE);
+    }
+    return value;
+}
+
+#else
+
+int bh__page_has_bti(uintptr_t address) {
+    (void)address;
+    return 0;
+}
+
+#endif
+
+static int bh__page_protection(uintptr_t page, int prot) {
+#if defined(__aarch64__)
+    if ((prot & PROT_EXEC) != 0 && bh__bti_enabled() &&
+        bh__page_has_bti(page)) {
+        prot |= BH_PROT_BTI;
+    }
+#else
+    (void)page;
+#endif
+    return prot;
 }
 
 size_t bh__page_size(void) {
@@ -238,11 +476,15 @@ static int bh__copy_code_impl(void *dst, const void *src, size_t size,
         if ((prot & PROT_READ) != 0) {
             memcpy(destination + done, source + done, chunk);
         } else {
-            if (mprotect((void *)page_start, page_size, prot | PROT_READ) != 0) {
+            int page_prot = bh__page_protection(page_start, prot);
+            if (mprotect((void *)page_start, page_size,
+                         page_prot | PROT_READ) != 0) {
                 return -1;
             }
             memcpy(destination + done, source + done, chunk);
-            (void)mprotect((void *)page_start, page_size, prot);
+            if (mprotect((void *)page_start, page_size, page_prot) != 0) {
+                return -1;
+            }
         }
         done += chunk;
     }
@@ -265,17 +507,79 @@ int bh__copy_code_partial(void *dst, const void *src, size_t size,
     return bh__copy_code_impl(dst, src, size, 1, copied);
 }
 
-static void bh__restore_page_protections(uintptr_t first_page, size_t page_size,
-                                         size_t page_count,
-                                         const int *saved_prot) {
+static int bh__restore_page_protections(uintptr_t first_page, size_t page_size,
+                                        size_t page_count,
+                                        const int *saved_prot) {
     size_t i;
+    int result = 0;
     for (i = 0; i < page_count; i++) {
-        (void)mprotect((void *)(first_page + i * page_size), page_size,
-                       saved_prot[i]);
+        if (mprotect((void *)(first_page + i * page_size), page_size,
+                     saved_prot[i]) != 0) {
+            result = -1;
+        }
     }
+    return result;
 }
 
 int bh__write_code(void *dst, const void *src, size_t size) {
+    int preserve_bti = 0;
+
+    if (dst != NULL) {
+        preserve_bti = bh__page_has_bti((uintptr_t)dst);
+    }
+    return bh__write_code_ex(dst, src, size, preserve_bti);
+}
+
+static int bh__write_code_atomic(uint8_t *dst, const uint8_t *src,
+                                 size_t size) {
+#if defined(__SANITIZE_THREAD__)
+    (void)dst;
+    (void)src;
+    (void)size;
+    return 0;
+#else
+    if (size == 4 && (((uintptr_t)dst) & 3u) == 0) {
+        uint32_t value;
+        memcpy(&value, src, sizeof(value));
+        __atomic_store_n((uint32_t *)dst, value, __ATOMIC_RELEASE);
+        return 1;
+    }
+    if (size == 8 && (((uintptr_t)dst) & 3u) == 0) {
+        uint32_t prefix;
+        uint32_t value;
+        memcpy(&prefix, src, sizeof(prefix));
+        if (__atomic_load_n((uint32_t *)dst, __ATOMIC_ACQUIRE) != prefix) {
+            return 0;
+        }
+        memcpy(&value, src + 4, sizeof(value));
+        __atomic_store_n((uint32_t *)(dst + 4), value, __ATOMIC_RELEASE);
+        return 1;
+    }
+#if defined(__x86_64__)
+    if (size == 5 && (((uintptr_t)dst) & 7u) == 0) {
+        uint64_t value = 0;
+        uint64_t current;
+
+        memcpy(&value, src, 5);
+        current = __atomic_load_n((uint64_t *)dst, __ATOMIC_ACQUIRE);
+        for (;;) {
+            uint64_t desired =
+                (current & ~UINT64_C(0xFFFFFFFFFF)) | value;
+            if (__atomic_compare_exchange_n((uint64_t *)dst, &current, desired,
+                                            0, __ATOMIC_ACQ_REL,
+                                            __ATOMIC_ACQUIRE)) {
+                break;
+            }
+        }
+        return 1;
+    }
+#endif
+    return 0;
+#endif
+}
+
+int bh__write_code_ex(void *dst, const void *src, size_t size,
+                      int preserve_bti) {
     uint8_t *destination = (uint8_t *)dst;
     const uint8_t *source = (const uint8_t *)src;
     size_t page_size = bh__page_size();
@@ -302,21 +606,52 @@ int bh__write_code(void *dst, const void *src, size_t size) {
     for (i = 0; i < page_count; i++) {
         uintptr_t page = first_page + i * page_size;
         int prot = 0;
+        int page_prot;
         if (bh__protect_query(page, &prot) != 0) {
-            bh__restore_page_protections(first_page, page_size, i, saved_prot);
+            (void)bh__restore_page_protections(first_page, page_size, i,
+                                               saved_prot);
             goto cleanup;
         }
-        saved_prot[i] = prot;
-        if (mprotect((void *)page, page_size, prot | PROT_READ | PROT_WRITE) != 0) {
-            bh__restore_page_protections(first_page, page_size, i, saved_prot);
-            goto cleanup;
+        page_prot = prot;
+#if defined(__aarch64__)
+        if (preserve_bti && bh__bti_enabled()) {
+            page_prot |= BH_PROT_BTI;
+        }
+#else
+        (void)preserve_bti;
+#endif
+        saved_prot[i] = page_prot;
+        if (mprotect((void *)page, page_size,
+                     page_prot | PROT_READ | PROT_WRITE) != 0) {
+#if defined(__aarch64__)
+            if ((page_prot & BH_PROT_BTI) != 0) {
+                page_prot &= ~BH_PROT_BTI;
+                saved_prot[i] = page_prot;
+                if (mprotect((void *)page, page_size,
+                             page_prot | PROT_READ | PROT_WRITE) != 0) {
+                    (void)bh__restore_page_protections(first_page, page_size,
+                                                       i, saved_prot);
+                    goto cleanup;
+                }
+            } else
+#endif
+            {
+                (void)bh__restore_page_protections(first_page, page_size, i,
+                                                   saved_prot);
+                goto cleanup;
+            }
         }
     }
 
-    memcpy(destination, source, size);
+    if (bh__write_code_atomic(destination, source, size) == 0) {
+        memcpy(destination, source, size);
+    }
     bh__flush_cache(dst, size);
 
-    bh__restore_page_protections(first_page, page_size, page_count, saved_prot);
+    if (bh__restore_page_protections(first_page, page_size, page_count,
+                                     saved_prot) != 0) {
+        goto cleanup;
+    }
     result = 0;
 
 cleanup:
@@ -332,20 +667,55 @@ int bh__write_pointer(void *address, uintptr_t value) {
     size_t page_size = bh__page_size();
     uintptr_t page = bh__align_down_ptr((uintptr_t)address, page_size);
     int prot = 0;
+    int page_prot;
+    int changed = 0;
 
     if (bh__protect_query((uintptr_t)address, &prot) != 0) {
         return -1;
     }
-    if ((prot & PROT_WRITE) == 0) {
-        if (mprotect((void *)page, page_size, prot | PROT_READ | PROT_WRITE) != 0) {
+    page_prot = bh__page_protection(page, prot);
+    if ((page_prot & PROT_WRITE) == 0) {
+        if (mprotect((void *)page, page_size,
+                     page_prot | PROT_READ | PROT_WRITE) != 0) {
             return -1;
         }
+        changed = 1;
     }
     __atomic_store_n((uintptr_t *)address, value, __ATOMIC_RELEASE);
-    if ((prot & PROT_WRITE) == 0) {
-        (void)mprotect((void *)page, page_size, prot);
+    if (changed && mprotect((void *)page, page_size, page_prot) != 0) {
+        return -1;
     }
     return 0;
+}
+
+int bh__cas_pointer(void *address, uintptr_t expected, uintptr_t desired) {
+    size_t page_size = bh__page_size();
+    uintptr_t page = bh__align_down_ptr((uintptr_t)address, page_size);
+    int prot = 0;
+    int page_prot;
+    int changed = 0;
+    int result;
+
+    if (bh__protect_query((uintptr_t)address, &prot) != 0) {
+        return -1;
+    }
+    page_prot = bh__page_protection(page, prot);
+    if ((page_prot & PROT_WRITE) == 0) {
+        if (mprotect((void *)page, page_size,
+                     page_prot | PROT_READ | PROT_WRITE) != 0) {
+            return -1;
+        }
+        changed = 1;
+    }
+    result = __atomic_compare_exchange_n((uintptr_t *)address, &expected,
+                                         desired, 0, __ATOMIC_ACQ_REL,
+                                         __ATOMIC_ACQUIRE)
+                 ? 1
+                 : 0;
+    if (changed && mprotect((void *)page, page_size, page_prot) != 0) {
+        return -1;
+    }
+    return result;
 }
 
 int bh__make_executable(void *address, size_t size) {
@@ -508,7 +878,7 @@ void *bh__alloc_near(uintptr_t target, size_t size, size_t max_distance) {
         qsort(gaps, gap_count, sizeof(bh_gap_t), bh__gap_compare);
     }
 
-    for (i = 0; i < gap_count && i < 64; i++) {
+    for (i = 0; i < gap_count; i++) {
         uintptr_t gap_start = gaps[i].start;
         uintptr_t gap_end = gaps[i].end;
         uintptr_t hint;

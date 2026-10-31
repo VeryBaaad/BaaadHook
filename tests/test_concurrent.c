@@ -88,6 +88,7 @@ int main(void) {
 
     (void)bh_inline_unhook_all();
     (void)bh_plt_unhook_all();
+    bh_inline_release_trampolines();
 
     if (bh_concurrent_target(2, 3) != 5) {
         fprintf(stderr, "inline target was not restored\n");

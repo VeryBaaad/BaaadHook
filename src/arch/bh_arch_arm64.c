@@ -16,6 +16,7 @@
 #define BH_ARM64_BTI_C 0xD503245Fu
 #define BH_ARM64_BR_X16 0xD61F0200u
 #define BH_ARM64_BLR_X16 0xD63F0200u
+#define BH_ARM64_RET_X16 0xD65F0200u
 
 static uint32_t bh_arm64_rd32(const uint8_t *p) {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
@@ -76,21 +77,33 @@ static int bh_arm64_emit_b(uint8_t *dst, size_t capacity, size_t *offset,
                                  (((uint32_t)(displacement >> 2)) & 0x03FFFFFFu));
 }
 
+static int bh_arm64_emit_bl(uint8_t *dst, size_t capacity, size_t *offset,
+                            uintptr_t from, uintptr_t target) {
+    int64_t displacement = (int64_t)target - (int64_t)from;
+    if ((displacement & 3) != 0 || displacement < -(1ll << 27) ||
+        displacement >= (1ll << 27)) {
+        return -1;
+    }
+    return bh_arm64_emit_u32(dst, capacity, offset,
+                             0x94000000u |
+                                 (((uint32_t)(displacement >> 2)) & 0x03FFFFFFu));
+}
+
 static int bh_arm64_emit_abs_jump(uint8_t *dst, size_t capacity, size_t *offset,
                                   uintptr_t target) {
     if (bh_arm64_align8(dst, capacity, offset) != 0) return -1;
-    size_t base = *offset;
     if (bh_arm64_emit_ldr_x16(dst, capacity, offset, 8) != 0) return -1;
-    if (bh_arm64_emit_u32(dst, capacity, offset, BH_ARM64_BR_X16) != 0) return -1;
+    if (bh_arm64_emit_u32(dst, capacity, offset, BH_ARM64_RET_X16) != 0) return -1;
     if (bh_arm64_emit_u64(dst, capacity, offset, (uint64_t)target) != 0) return -1;
-    (void)base;
     return 0;
 }
 
 static int bh_arm64_emit_abs_call(uint8_t *dst, size_t capacity, size_t *offset,
                                   uintptr_t target) {
+    size_t base;
+
     if (bh_arm64_align8(dst, capacity, offset) != 0) return -1;
-    size_t base = *offset;
+    base = *offset;
     if (bh_arm64_emit_ldr_x16(dst, capacity, offset, 16) != 0) return -1;
     if (bh_arm64_emit_u32(dst, capacity, offset, BH_ARM64_BLR_X16) != 0) return -1;
     if (bh_arm64_emit_b(dst, capacity, offset, (uintptr_t)dst + *offset,
@@ -101,31 +114,75 @@ static int bh_arm64_emit_abs_call(uint8_t *dst, size_t capacity, size_t *offset,
     return 0;
 }
 
-static int bh_arm64_emit_conditional(uint8_t *dst, size_t capacity, size_t *offset,
-                                     uint32_t branch_insn, uintptr_t target) {
-    if (bh_arm64_align8(dst, capacity, offset) != 0) return -1;
-    size_t base = *offset;
-    uint32_t inverted = branch_insn;
+static int bh_arm64_encode_conditional(uint32_t insn, int64_t displacement,
+                                       uint32_t *out) {
+    int64_t imm;
 
-    if ((branch_insn & 0xFF000010u) == 0x54000000u) {
-        inverted ^= 1u;
-        inverted = (inverted & ~(0x7FFFFu << 5)) | (6u << 5);
-    } else if ((branch_insn & 0x7E000000u) == 0x34000000u) {
-        inverted ^= (1u << 24);
-        inverted = (inverted & ~(0x7FFFFu << 5)) | (6u << 5);
-    } else if ((branch_insn & 0x7E000000u) == 0x36000000u) {
-        inverted ^= (1u << 24);
-        inverted = (inverted & ~(0x3FFFu << 5)) | (6u << 5);
+    if ((displacement & 3) != 0) return -1;
+    imm = displacement >> 2;
+    if ((insn & 0xFF000010u) == 0x54000000u) {
+        if (imm < -(1ll << 18) || imm >= (1ll << 18)) return -1;
+        *out = (insn & ~(0x7FFFFu << 5)) | (((uint32_t)imm & 0x7FFFFu) << 5);
+        return 0;
+    }
+    if ((insn & 0x7E000000u) == 0x34000000u) {
+        if (imm < -(1ll << 18) || imm >= (1ll << 18)) return -1;
+        *out = (insn & ~(0x7FFFFu << 5)) | (((uint32_t)imm & 0x7FFFFu) << 5);
+        return 0;
+    }
+    if ((insn & 0x7E000000u) == 0x36000000u) {
+        if (imm < -(1ll << 13) || imm >= (1ll << 13)) return -1;
+        *out = (insn & ~(0x3FFFu << 5)) | (((uint32_t)imm & 0x3FFFu) << 5);
+        return 0;
+    }
+    return -1;
+}
+
+static int bh_arm64_invert_conditional(uint32_t insn, uint32_t imm_field,
+                                       uint32_t *out) {
+    uint32_t value = insn;
+
+    if ((insn & 0xFF000010u) == 0x54000000u) {
+        value ^= 1u;
+        value = (value & ~(0x7FFFFu << 5)) | ((imm_field & 0x7FFFFu) << 5);
+    } else if ((insn & 0x7E000000u) == 0x34000000u) {
+        value ^= (1u << 24);
+        value = (value & ~(0x7FFFFu << 5)) | ((imm_field & 0x7FFFFu) << 5);
+    } else if ((insn & 0x7E000000u) == 0x36000000u) {
+        value ^= (1u << 24);
+        value = (value & ~(0x3FFFu << 5)) | ((imm_field & 0x3FFFu) << 5);
     } else {
         return -1;
     }
+    *out = value;
+    return 0;
+}
 
+static int bh_arm64_emit_conditional(uint8_t *dst, size_t capacity, size_t *offset,
+                                     uint32_t branch_insn, uintptr_t target) {
+    uintptr_t base = (uintptr_t)dst + *offset;
+    int64_t displacement = (int64_t)target - (int64_t)base;
+    uint32_t encoded;
+    uint32_t inverted;
+    int64_t b_displacement = (int64_t)target - (int64_t)(base + 4);
+    int b_fits = (b_displacement & 3) == 0 &&
+                 b_displacement >= -(1ll << 27) &&
+                 b_displacement < (1ll << 27);
+
+    if (bh_arm64_encode_conditional(branch_insn, displacement, &encoded) == 0) {
+        return bh_arm64_emit_u32(dst, capacity, offset, encoded);
+    }
+    if (bh_arm64_invert_conditional(branch_insn, b_fits ? 2u : 6u, &inverted) != 0) {
+        return -1;
+    }
     if (bh_arm64_emit_u32(dst, capacity, offset, inverted) != 0) return -1;
+    if (b_fits) {
+        return bh_arm64_emit_b(dst, capacity, offset, base + 4, target);
+    }
     if (bh_arm64_emit_ldr_x16(dst, capacity, offset, 12) != 0) return -1;
-    if (bh_arm64_emit_u32(dst, capacity, offset, BH_ARM64_BR_X16) != 0) return -1;
+    if (bh_arm64_emit_u32(dst, capacity, offset, BH_ARM64_RET_X16) != 0) return -1;
     if (bh_arm64_emit_u32(dst, capacity, offset, BH_ARM64_NOP) != 0) return -1;
     if (bh_arm64_emit_u64(dst, capacity, offset, (uint64_t)target) != 0) return -1;
-    (void)base;
     return 0;
 }
 
@@ -232,13 +289,21 @@ int bh_arch_relocate(const uint8_t *src_bytes, uintptr_t src_address,
             int64_t displacement = bh_arm64_sign_extend(insn & 0x03FFFFFFu, 26) << 2;
             uintptr_t target = (uintptr_t)((int64_t)instruction_address + displacement);
             if ((insn & 0x80000000u) != 0) {
-                if (bh_arm64_emit_abs_call((uint8_t *)dst, dst_capacity, &output_offset,
-                                           target) != 0)
-                    return -1;
+                if (bh_arm64_emit_bl((uint8_t *)dst, dst_capacity, &output_offset,
+                                     (uintptr_t)dst + output_offset,
+                                     target) != 0) {
+                    if (bh_arm64_emit_abs_call((uint8_t *)dst, dst_capacity,
+                                               &output_offset, target) != 0)
+                        return -1;
+                }
             } else {
-                if (bh_arm64_emit_abs_jump((uint8_t *)dst, dst_capacity, &output_offset,
-                                           target) != 0)
-                    return -1;
+                if (bh_arm64_emit_b((uint8_t *)dst, dst_capacity, &output_offset,
+                                    (uintptr_t)dst + output_offset,
+                                    target) != 0) {
+                    if (bh_arm64_emit_abs_jump((uint8_t *)dst, dst_capacity,
+                                               &output_offset, target) != 0)
+                        return -1;
+                }
             }
         } else if ((insn & 0xFF000010u) == 0x54000000u) {
             int64_t displacement = bh_arm64_sign_extend((insn >> 5) & 0x7FFFFu, 19) << 2;
@@ -291,9 +356,13 @@ int bh_arch_relocate(const uint8_t *src_bytes, uintptr_t src_address,
         source_offset += 4;
     }
 
-    if (bh_arm64_emit_abs_jump((uint8_t *)dst, dst_capacity, &output_offset,
-                               src_address + source_offset) != 0) {
-        return -1;
+    if (bh_arm64_emit_b((uint8_t *)dst, dst_capacity, &output_offset,
+                        (uintptr_t)dst + output_offset,
+                        src_address + source_offset) != 0) {
+        if (bh_arm64_emit_abs_jump((uint8_t *)dst, dst_capacity, &output_offset,
+                                   src_address + source_offset) != 0) {
+            return -1;
+        }
     }
 
     *out_len = output_offset;
@@ -348,6 +417,12 @@ int bh_arch_emit_patch(void *target, const void *dest, const void *relay,
         bytes[3] = (uint8_t)(insn >> 24);
     }
     return 4;
+}
+
+size_t bh_arch_entry_prefix(const uint8_t *bytes, size_t size) {
+    if (bytes == NULL || size < 4) return 0;
+    if ((bh_arm64_rd32(bytes) & 0xFFFFFF3Fu) == 0xD503241Fu) return 4;
+    return 0;
 }
 
 #endif /* __aarch64__ */

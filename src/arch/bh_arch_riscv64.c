@@ -17,10 +17,6 @@
 #define BH_RV_T0 5u
 #define BH_RV_RA 1u
 
-static uint16_t bh_rv_rd16(const uint8_t *p) {
-    return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
-}
-
 static uint32_t bh_rv_rd32(const uint8_t *p) {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
            ((uint32_t)p[3] << 24);
@@ -128,9 +124,30 @@ static int bh_rv_emit_materialize(uint8_t *dst, size_t capacity, size_t *offset,
     return 0;
 }
 
+static int bh_rv_emit_jal_direct(uint8_t *dst, size_t capacity, size_t *offset,
+                                 uintptr_t from, uintptr_t target,
+                                 unsigned rd) {
+    int64_t delta = (int64_t)target - (int64_t)from;
+
+    if ((delta & 1) != 0 || delta < -(1ll << 20) || delta >= (1ll << 20)) {
+        return -1;
+    }
+    return bh_rv_emit_u32(dst, capacity, offset,
+                          bh_rv_encode_jal(rd, (int32_t)delta));
+}
+
 static int bh_rv_emit_cond_jump(uint8_t *dst, size_t capacity, size_t *offset,
                                 unsigned rs1, unsigned rs2, unsigned funct3,
                                 uintptr_t target) {
+    uintptr_t from = (uintptr_t)dst + *offset;
+    int64_t delta = (int64_t)target - (int64_t)(from + 4);
+
+    if ((delta & 1) == 0 && delta >= -(1ll << 20) && delta < (1ll << 20)) {
+        if (bh_rv_emit_u32(dst, capacity, offset,
+                           bh_rv_encode_b(rs1, rs2, 8, funct3)) != 0)
+            return -1;
+        return bh_rv_emit_jal_direct(dst, capacity, offset, from + 4, target, 0);
+    }
     if (bh_rv_align8(dst, capacity, offset) != 0) return -1;
     if (bh_rv_emit_u32(dst, capacity, offset,
                        bh_rv_encode_b(rs1, rs2, 32, funct3)) != 0)
@@ -178,6 +195,16 @@ int bh_arch_relocate(const uint8_t *src_bytes, uintptr_t src_address,
         return -1;
     }
 
+    {
+        uint16_t hw1 = (uint16_t)((uint16_t)src_bytes[0] |
+                                  ((uint16_t)src_bytes[1] << 8));
+        if (hw1 == 0x8082u) {
+            if (min_bytes > 2) return -1;
+        } else if ((hw1 & 3u) == 3u) {
+            if (bh_rv_rd32(src_bytes) == 0x00008067u && min_bytes > 4) return -1;
+        }
+    }
+
     while (source_offset < min_bytes) {
         uint32_t insn;
         unsigned size;
@@ -201,11 +228,18 @@ int bh_arch_relocate(const uint8_t *src_bytes, uintptr_t src_address,
                 imm |= ((insn >> 3) & 7u) << 1;
                 imm |= ((insn >> 2) & 1u) << 5;
                 displacement = bh_rv_sign_extend(imm, 12);
-                if (bh_rv_emit_abs_jump((uint8_t *)dst, dst_capacity,
-                                        &output_offset,
-                                        (uintptr_t)((int64_t)address + displacement),
-                                        0) != 0)
-                    return -1;
+                if (bh_rv_emit_jal_direct((uint8_t *)dst, dst_capacity,
+                                          &output_offset,
+                                          (uintptr_t)dst + output_offset,
+                                          (uintptr_t)((int64_t)address + displacement),
+                                          0) != 0) {
+                    if (bh_rv_emit_abs_jump((uint8_t *)dst, dst_capacity,
+                                            &output_offset,
+                                            (uintptr_t)((int64_t)address +
+                                                        displacement),
+                                            0) != 0)
+                        return -1;
+                }
             } else if ((insn & 0xE003u) == 0xC001u ||
                        (insn & 0xE003u) == 0xE001u) { /* c.beqz / c.bnez */
                 uint32_t imm = 0;
@@ -250,10 +284,18 @@ int bh_arch_relocate(const uint8_t *src_bytes, uintptr_t src_address,
             raw |= ((insn >> 20) & 1u) << 11;
             raw |= ((insn >> 21) & 0x3FFu) << 1;
             displacement = bh_rv_sign_extend(raw, 21);
-            if (bh_rv_emit_abs_jump((uint8_t *)dst, dst_capacity, &output_offset,
-                                    (uintptr_t)((int64_t)address + displacement),
-                                    rd) != 0)
-                return -1;
+            if (bh_rv_emit_jal_direct((uint8_t *)dst, dst_capacity,
+                                      &output_offset,
+                                      (uintptr_t)dst + output_offset,
+                                      (uintptr_t)((int64_t)address + displacement),
+                                      rd) != 0) {
+                if (bh_rv_emit_abs_jump((uint8_t *)dst, dst_capacity,
+                                        &output_offset,
+                                        (uintptr_t)((int64_t)address +
+                                                    displacement),
+                                        rd) != 0)
+                    return -1;
+            }
         } else if ((insn & 0x7Fu) == 0x63u) { /* b<cond> */
             unsigned funct3 = (insn >> 12) & 7u;
             unsigned rs1 = (insn >> 15) & 0x1Fu;
@@ -281,9 +323,13 @@ int bh_arch_relocate(const uint8_t *src_bytes, uintptr_t src_address,
         source_offset += size;
     }
 
-    if (bh_rv_emit_abs_jump((uint8_t *)dst, dst_capacity, &output_offset,
-                            src_address + source_offset, 0) != 0)
-        return -1;
+    if (bh_rv_emit_jal_direct((uint8_t *)dst, dst_capacity, &output_offset,
+                              (uintptr_t)dst + output_offset,
+                              src_address + source_offset, 0) != 0) {
+        if (bh_rv_emit_abs_jump((uint8_t *)dst, dst_capacity, &output_offset,
+                                src_address + source_offset, 0) != 0)
+            return -1;
+    }
 
     *out_len = output_offset;
     *copied = source_offset;
@@ -329,6 +375,13 @@ int bh_arch_emit_patch(void *target, const void *dest, const void *relay,
     bytes[prefix + 2] = (uint8_t)(encoded >> 16);
     bytes[prefix + 3] = (uint8_t)(encoded >> 24);
     return (int)patch_size;
+}
+
+
+size_t bh_arch_entry_prefix(const uint8_t *bytes, size_t size) {
+    (void)bytes;
+    (void)size;
+    return 0;
 }
 
 #endif /* riscv64 */

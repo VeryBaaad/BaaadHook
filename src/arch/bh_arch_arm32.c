@@ -18,6 +18,7 @@
 #define BH_ARM_BLX_R12 0xE12FFF3Cu
 #define BH_THUMB_BX_R12 0x4760u
 #define BH_THUMB_BLX_R12 0x47E0u
+#define BH_ARM_MATERIALIZE_SIZE 16u
 
 static uint16_t bh_arm_rd16(const uint8_t *p) {
     return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
@@ -146,6 +147,20 @@ static int bh_arm_emit_materialize(uint8_t *dst, size_t capacity, size_t *offset
     return bh_arm_emit_u32(dst, capacity, offset, value);
 }
 
+static int bh_arm_emit_conditional_materialize(uint8_t *dst, size_t capacity,
+                                               size_t *offset, unsigned rd,
+                                               uint32_t value,
+                                               unsigned condition) {
+    if (condition != 0xEu) {
+        size_t base = *offset;
+        if (bh_arm_emit_b(dst, capacity, offset, (uintptr_t)dst + base,
+                          (uintptr_t)dst + base + 4u + BH_ARM_MATERIALIZE_SIZE,
+                          condition ^ 1u) != 0)
+            return -1;
+    }
+    return bh_arm_emit_materialize(dst, capacity, offset, rd, value);
+}
+
 static int bh_arm_emit_literal_load(uint8_t *dst, size_t capacity, size_t *offset,
                                     uint32_t insn, uintptr_t address) {
     uint32_t rewritten = (insn & ~0x000F0FFFu) | (12u << 16);
@@ -236,7 +251,7 @@ static uint32_t bh_thumb_bw(uintptr_t from, uintptr_t target) {
     j1 = ((~i1) & 1u) ^ s;
     j2 = ((~i2) & 1u) ^ s;
     return (0xF000u | (s << 10) | imm10) |
-           ((0x9000u | (j1 << 13) | (j2 << 11) | imm11) << 16);
+           ((0x8800u | (j1 << 13) | (j2 << 12) | imm11) << 16);
 }
 
 static int bh_thumb_emit_ldr16(uint8_t *dst, size_t capacity, size_t *offset,
@@ -270,7 +285,9 @@ static int bh_arm_relocate_arm(const uint8_t *src_bytes, uintptr_t src_address,
         int64_t displacement = bh_arm_sign_extend(insn & 0x00FFFFFFu, 24) << 2;
         uintptr_t target = (uintptr_t)((int64_t)((src_address + 8u) & ~(uintptr_t)3u) +
                                        displacement + ((insn >> 24) & 1u) * 2u);
-        target |= 1u;
+        if ((insn >> 24) & 1u) {
+            target |= 1u;
+        }
         if (bh_arm_emit_abs_call((uint8_t *)dst, dst_capacity, &offset, target) != 0)
             return -1;
     } else if ((insn & 0x0E000000u) == 0x0A000000u && condition != 0xFu) {
@@ -319,13 +336,18 @@ static int bh_arm_relocate_arm(const uint8_t *src_bytes, uintptr_t src_address,
         uint32_t target = (insn & 0x00400000u) ? src_address + 8u - value
                                                : src_address + 8u + value;
         unsigned rd = (insn >> 12) & 0xFu;
-        if (bh_arm_emit_materialize((uint8_t *)dst, dst_capacity, &offset, rd,
-                                    target) != 0)
+        if ((insn & 0x00100000u) != 0 || condition == 0xFu) return -1;
+        if (bh_arm_emit_conditional_materialize((uint8_t *)dst, dst_capacity,
+                                                &offset, rd, target,
+                                                condition) != 0)
             return -1;
     } else if ((insn & 0x0FEF000Fu) == 0x01A0000Fu) {
         unsigned rd = (insn >> 12) & 0xFu;
-        if (bh_arm_emit_materialize((uint8_t *)dst, dst_capacity, &offset, rd,
-                                    (uint32_t)(src_address + 8u)) != 0)
+        if ((insn & 0x00100000u) != 0 || (insn & 0xFF0u) != 0) return -1;
+        if (bh_arm_emit_conditional_materialize((uint8_t *)dst, dst_capacity,
+                                                &offset, rd,
+                                                (uint32_t)(src_address + 8u),
+                                                condition) != 0)
             return -1;
     } else if ((insn & 0x0F000000u) == 0x0D000000u &&
                (insn & 0x00200000u) == 0 && (insn & 0x00100000u) != 0 &&
@@ -339,9 +361,12 @@ static int bh_arm_relocate_arm(const uint8_t *src_bytes, uintptr_t src_address,
             return -1;
     }
 
-    if (bh_arm_emit_abs_jump((uint8_t *)dst, dst_capacity, &offset,
-                             src_address + 4u) != 0)
-        return -1;
+    if (bh_arm_emit_b((uint8_t *)dst, dst_capacity, &offset,
+                      (uintptr_t)dst + offset, src_address + 4u, 0xEu) != 0) {
+        if (bh_arm_emit_abs_jump((uint8_t *)dst, dst_capacity, &offset,
+                                 src_address + 4u) != 0)
+            return -1;
+    }
 
     *out_len = offset;
     *copied = 4;
@@ -350,7 +375,7 @@ static int bh_arm_relocate_arm(const uint8_t *src_bytes, uintptr_t src_address,
 
 static int bh_arm_relocate_thumb(const uint8_t *src_bytes, uintptr_t src_address,
                                  void *dst, size_t dst_capacity, size_t *out_len,
-                                 size_t *copied) {
+                                 size_t *copied, size_t min_bytes) {
     size_t source_offset = 0;
     size_t output_offset = 0;
 
@@ -361,6 +386,15 @@ static int bh_arm_relocate_thumb(const uint8_t *src_bytes, uintptr_t src_address
         if (source_offset + 4 > 32) return -1;
         hw1 = bh_arm_rd16(src_bytes + source_offset);
         instruction_address = src_address + source_offset;
+
+        if ((source_offset == 0 || source_offset == 2) &&
+            (hw1 & 0xFF00u) == 0xBF00u && (hw1 & 0xFu) != 0) {
+            return -1;
+        }
+        if (source_offset == 0 && min_bytes > 2 &&
+            (hw1 == 0x4770u || (hw1 & 0xFF00u) == 0xBD00u)) {
+            return -1;
+        }
 
         if ((hw1 & 0xFF00u) == 0x4600u && ((hw1 >> 3) & 0xFu) == 0xFu) {
             /* MOV Rd */
@@ -407,9 +441,9 @@ static int bh_arm_relocate_thumb(const uint8_t *src_bytes, uintptr_t src_address
             unsigned rn = hw1 & 7u;
             unsigned i = (hw1 >> 9) & 1u;
             unsigned imm5 = (hw1 >> 3) & 0x1Fu;
-            int64_t displacement = bh_arm_sign_extend((i << 6) | (imm5 << 1), 7);
-            uintptr_t target = (uintptr_t)((int64_t)(instruction_address + 4u) +
-                                           displacement) | 1u;
+            uint32_t displacement = (i << 6) | (imm5 << 1);
+            uintptr_t target =
+                (uintptr_t)(instruction_address + 4u + displacement) | 1u;
             unsigned inverse = ((hw1 >> 11) & 1u) ^ 1u;
             uint16_t branch = (uint16_t)(0xB100u | (inverse << 11) | (6u << 3) | rn);
             if (bh_arm_align4((uint8_t *)dst, dst_capacity, &output_offset, 1) != 0)
@@ -594,9 +628,20 @@ static int bh_arm_relocate_thumb(const uint8_t *src_bytes, uintptr_t src_address
 
     if (bh_arm_align4((uint8_t *)dst, dst_capacity, &output_offset, 1) != 0)
         return -1;
-    if (bh_thumb_emit_abs_jump((uint8_t *)dst, dst_capacity, &output_offset,
-                               (src_address + source_offset) | 1u) != 0)
-        return -1;
+    {
+        uint32_t branch = bh_thumb_bw((uintptr_t)dst + output_offset,
+                                      src_address + source_offset);
+        if (branch != 0) {
+            if (bh_arm_emit_u32((uint8_t *)dst, dst_capacity, &output_offset,
+                                branch) != 0)
+                return -1;
+        } else {
+            if (bh_thumb_emit_abs_jump((uint8_t *)dst, dst_capacity,
+                                       &output_offset,
+                                       (src_address + source_offset) | 1u) != 0)
+                return -1;
+        }
+    }
 
     *out_len = output_offset;
     *copied = source_offset;
@@ -618,7 +663,7 @@ int bh_arch_relocate(const uint8_t *src_bytes, uintptr_t src_address,
     }
     if (thumb) {
         return bh_arm_relocate_thumb(src_bytes, src_address, dst, dst_capacity,
-                                     out_len, copied);
+                                     out_len, copied, min_bytes);
     }
     return bh_arm_relocate_arm(src_bytes, src_address, dst, dst_capacity, out_len,
                                copied);
@@ -680,6 +725,13 @@ int bh_arch_emit_patch(void *target, const void *dest, const void *relay,
         bytes[3] = (uint8_t)(encoded >> 24);
     }
     return 4;
+}
+
+
+size_t bh_arch_entry_prefix(const uint8_t *bytes, size_t size) {
+    (void)bytes;
+    (void)size;
+    return 0;
 }
 
 #endif /* __arm__ */

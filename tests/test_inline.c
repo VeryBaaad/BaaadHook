@@ -78,11 +78,13 @@ int main(void) {
             CHECK(bh_inline_unhook((void *)bh_test_add) == BH_INLINE_OK);
         }
     }
+    bh_inline_release_trampolines();
     CHECK(bh_inline_hook((void *)bh_test_add, (void *)bh_hook_add, &original) ==
           BH_INLINE_OK);
     bh_orig_add = (int (*)(int, int))original;
     CHECK(bh_test_add(4, 5) == 109);
     CHECK(bh_inline_unhook_all() >= 1);
+    bh_inline_release_trampolines();
     CHECK(bh_test_add(1, 1) == 2);
     CHECK(bh_inline_unhook((void *)bh_test_add) == BH_INLINE_ERROR_NOT_HOOKED);
 
@@ -108,6 +110,7 @@ int main(void) {
           1 + 4 + 9 + 16 + 25 + 36 + 49 + 64 + 1);
 
     CHECK(bh_inline_unhook_all() == 3);
+    bh_inline_release_trampolines();
     CHECK(bh_test_read_global() == 7);
     CHECK(bh_test_sub(9, 4) == 5);
 

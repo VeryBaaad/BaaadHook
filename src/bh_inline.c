@@ -22,16 +22,20 @@ typedef struct bh_inline_record {
     void *trampoline;
     void *relay;
     uint8_t original_bytes[BH_INLINE_MAX_PATCH];
+    uint8_t patch_bytes[BH_INLINE_MAX_PATCH];
     size_t patch_size;
+    size_t covered;
     size_t trampoline_length;
     size_t mapping_size;
     int thumb;
+    int bti;
     int active;
     struct bh_inline_record *next;
 } bh_inline_record_t;
 
 static pthread_mutex_t bh_inline_lock = PTHREAD_MUTEX_INITIALIZER;
 static bh_inline_record_t *bh_inline_records = NULL;
+static bh_inline_record_t *bh_inline_retired = NULL;
 
 static uintptr_t bh_inline_normalize(uintptr_t address) {
 #if defined(__arm__)
@@ -75,7 +79,7 @@ static int bh_inline_overlaps(uintptr_t target, size_t patch_size) {
     bh_inline_record_t *record = bh_inline_records;
     while (record != NULL) {
         if (record->active) {
-            uintptr_t record_end = record->target + record->patch_size;
+            uintptr_t record_end = record->target + record->covered;
             uintptr_t target_end = target + patch_size;
             if (target < record_end && record->target < target_end) {
                 return 1;
@@ -98,12 +102,16 @@ int bh_inline_hook(void *target_argument, void *replacement, void **original) {
     size_t mapping_size;
     size_t code_capacity;
     size_t patch_size;
+    size_t entry_prefix = 0;
+    size_t relocate_size;
+    size_t covered = 0;
     size_t trampoline_length = 0;
     size_t copied = 0;
     size_t prologue_size = 0;
     size_t relay_offset;
     void *relay = NULL;
     int thumb;
+    int target_bti = 0;
     void *installed_trampoline = NULL;
     int status = BH_INLINE_OK;
 
@@ -128,6 +136,7 @@ int bh_inline_hook(void *target_argument, void *replacement, void **original) {
     if (!bh__is_executable_range(target_address, patch_size)) {
         return BH_INLINE_ERROR_NOT_EXECUTABLE;
     }
+    target_bti = bh__page_has_bti(target_address);
 
     page_size = bh__page_size();
     mapping_size = page_size;
@@ -150,21 +159,58 @@ int bh_inline_hook(void *target_argument, void *replacement, void **original) {
         goto fail;
     }
 
+    entry_prefix = bh_arch_entry_prefix(original_bytes, prologue_size);
+    if (entry_prefix != 0) {
+        size_t next_size;
+
+        if (entry_prefix >= BH_INLINE_MAX_PATCH) {
+            status = BH_INLINE_ERROR_ARCHITECTURE;
+            goto fail;
+        }
+        next_size = bh_arch_patch_size(target_address + entry_prefix, thumb);
+        if (next_size == 0 || next_size > arch.patch_size ||
+            entry_prefix + next_size > BH_INLINE_MAX_PATCH) {
+            status = BH_INLINE_ERROR_ARCHITECTURE;
+            goto fail;
+        }
+        patch_size = entry_prefix + next_size;
+        if (!bh__is_executable_range(target_address, patch_size)) {
+            status = BH_INLINE_ERROR_NOT_EXECUTABLE;
+            goto fail;
+        }
+        if (bh_inline_overlaps(target, patch_size)) {
+            status = BH_INLINE_ERROR_ALREADY_HOOKED;
+            goto fail;
+        }
+        if (prologue_size < patch_size) {
+            status = BH_INLINE_ERROR_MEMORY_PROTECTION;
+            goto fail;
+        }
+    }
+    relocate_size = patch_size - entry_prefix;
+
     mapping = bh__alloc_near(target, mapping_size, arch.max_distance);
     if (mapping == NULL) {
         status = BH_INLINE_ERROR_OUT_OF_MEMORY;
         goto fail;
     }
 
-    if (bh_arch_relocate(original_bytes, target_address, patch_size, thumb,
+    if (bh_arch_relocate(original_bytes + entry_prefix,
+                         target_address + entry_prefix, relocate_size, thumb,
                          mapping, code_capacity, &trampoline_length,
                          &copied) != 0) {
         status = BH_INLINE_ERROR_UNSUPPORTED;
         goto fail;
     }
-    if (trampoline_length == 0 || copied < patch_size ||
-        copied > prologue_size) {
+    if (trampoline_length == 0 || copied < relocate_size ||
+        copied > prologue_size - entry_prefix) {
         status = BH_INLINE_ERROR_UNSUPPORTED;
+        goto fail;
+    }
+
+    covered = entry_prefix + copied;
+    if (bh_inline_overlaps(target, covered)) {
+        status = BH_INLINE_ERROR_ALREADY_HOOKED;
         goto fail;
     }
 
@@ -182,17 +228,22 @@ int bh_inline_hook(void *target_argument, void *replacement, void **original) {
         }
     }
 
-    if (bh_arch_emit_patch((void *)target_address, replacement, relay, thumb,
-                           patch_bytes, sizeof(patch_bytes)) !=
-        (int)patch_size) {
+    if (bh_arch_emit_patch((void *)(target_address + entry_prefix), replacement,
+                           relay, thumb, patch_bytes + entry_prefix,
+                           sizeof(patch_bytes) - entry_prefix) !=
+        (int)relocate_size) {
         status = BH_INLINE_ERROR_ARCHITECTURE;
         goto fail;
+    }
+    if (entry_prefix != 0) {
+        memcpy(patch_bytes, original_bytes, entry_prefix);
     }
 
     if (bh__make_executable(mapping, mapping_size) != 0) {
         status = BH_INLINE_ERROR_MEMORY_PROTECTION;
         goto fail;
     }
+    bh__flush_cache(mapping, mapping_size);
 
     record = (bh_inline_record_t *)calloc(1, sizeof(*record));
     if (record == NULL) {
@@ -207,26 +258,40 @@ int bh_inline_hook(void *target_argument, void *replacement, void **original) {
     record->trampoline = thumb ? (void *)((uintptr_t)mapping | 1u) : mapping;
     record->relay = relay;
     record->patch_size = patch_size;
+    record->covered = covered;
     record->trampoline_length = trampoline_length;
     record->mapping_size = mapping_size;
     record->thumb = thumb;
+    record->bti = target_bti;
     record->active = 1;
     memcpy(record->original_bytes, original_bytes, patch_size);
-
-    if (bh__write_code((void *)target_address, patch_bytes, patch_size) != 0) {
-        status = BH_INLINE_ERROR_MEMORY_PROTECTION;
-        goto fail;
-    }
+    memcpy(record->patch_bytes, patch_bytes, patch_size);
 
     installed_trampoline = record->trampoline;
+    if (original != NULL) {
+        __atomic_store_n(original, installed_trampoline, __ATOMIC_RELEASE);
+    }
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+    if (bh__write_code_ex((void *)target_address, patch_bytes, patch_size,
+                          target_bti) != 0) {
+        uint8_t check_bytes[BH_INLINE_MAX_PATCH];
+        int applied =
+            bh__copy_code(check_bytes, (const void *)target_address, patch_size) == 0 &&
+            memcmp(check_bytes, patch_bytes, patch_size) == 0;
+        if (!applied) {
+            if (original != NULL) {
+                __atomic_store_n(original, (void *)NULL, __ATOMIC_RELEASE);
+            }
+            status = BH_INLINE_ERROR_MEMORY_PROTECTION;
+            goto fail;
+        }
+    }
+
     record->next = bh_inline_records;
     bh_inline_records = record;
     record = NULL;
     pthread_mutex_unlock(&bh_inline_lock);
-
-    if (original != NULL) {
-        *original = installed_trampoline;
-    }
 
     return BH_INLINE_OK;
 
@@ -265,35 +330,53 @@ int bh_inline_unhook(void *target_argument) {
         pthread_mutex_unlock(&bh_inline_lock);
         return BH_INLINE_ERROR_NOT_HOOKED;
     }
-    result = bh__write_code((void *)record->target, record->original_bytes,
-                            record->patch_size);
+    result = bh__write_code_ex((void *)record->target, record->original_bytes,
+                               record->patch_size, record->bti);
+    if (result != 0) {
+        uint8_t check_bytes[BH_INLINE_MAX_PATCH];
+        if (bh__copy_code(check_bytes, (const void *)record->target,
+                          record->patch_size) == 0 &&
+            memcmp(check_bytes, record->original_bytes, record->patch_size) == 0) {
+            result = 0;
+        }
+    }
     if (result == 0) {
         record->active = 0;
         *link = record->next;
-        record->next = NULL;
+        record->next = bh_inline_retired;
+        bh_inline_retired = record;
     }
     pthread_mutex_unlock(&bh_inline_lock);
 
     if (result != 0) {
         return BH_INLINE_ERROR_MEMORY_PROTECTION;
     }
-    bh_inline_record_destroy(record);
     return BH_INLINE_OK;
 }
 
 int bh_inline_unhook_all(void) {
     bh_inline_record_t **link;
-    bh_inline_record_t *retired = NULL;
     int count = 0;
 
     pthread_mutex_lock(&bh_inline_lock);
     link = &bh_inline_records;
     while (*link != NULL) {
         bh_inline_record_t *record = *link;
+        bh_inline_record_t *next = record->next;
 
         if (record->active) {
-            if (bh__write_code((void *)record->target, record->original_bytes,
-                               record->patch_size) != 0) {
+            int restored = bh__write_code_ex((void *)record->target,
+                                             record->original_bytes,
+                                             record->patch_size, record->bti);
+            if (restored != 0) {
+                uint8_t check_bytes[BH_INLINE_MAX_PATCH];
+                restored =
+                    bh__copy_code(check_bytes, (const void *)record->target,
+                                  record->patch_size) != 0 ||
+                    memcmp(check_bytes, record->original_bytes,
+                           record->patch_size) != 0;
+            }
+            if (restored != 0) {
                 link = &record->next;
                 continue;
             }
@@ -301,10 +384,21 @@ int bh_inline_unhook_all(void) {
             count++;
         }
 
-        *link = record->next;
-        record->next = retired;
-        retired = record;
+        *link = next;
+        record->next = bh_inline_retired;
+        bh_inline_retired = record;
     }
+    pthread_mutex_unlock(&bh_inline_lock);
+
+    return count;
+}
+
+void bh_inline_release_trampolines(void) {
+    bh_inline_record_t *retired;
+
+    pthread_mutex_lock(&bh_inline_lock);
+    retired = bh_inline_retired;
+    bh_inline_retired = NULL;
     pthread_mutex_unlock(&bh_inline_lock);
 
     while (retired != NULL) {
@@ -312,19 +406,27 @@ int bh_inline_unhook_all(void) {
         bh_inline_record_destroy(retired);
         retired = next;
     }
-    return count;
 }
 
 int bh_inline_is_hooked(const void *target_argument) {
+    bh_inline_record_t *record;
     uintptr_t target;
-    int result;
+    int result = 0;
 
     if (target_argument == NULL) {
         return 0;
     }
     target = bh_inline_normalize((uintptr_t)target_argument);
     pthread_mutex_lock(&bh_inline_lock);
-    result = bh_inline_find_active(target) != NULL;
+    record = bh_inline_find_active(target);
+    if (record != NULL) {
+        uint8_t check_bytes[BH_INLINE_MAX_PATCH];
+        if (bh__copy_code(check_bytes, (const void *)record->target,
+                          record->patch_size) == 0 &&
+            memcmp(check_bytes, record->patch_bytes, record->patch_size) == 0) {
+            result = 1;
+        }
+    }
     pthread_mutex_unlock(&bh_inline_lock);
     return result;
 }

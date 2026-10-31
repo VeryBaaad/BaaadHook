@@ -11,8 +11,31 @@ target_link_libraries(bh_plt_test PRIVATE baaadhook)
 target_compile_options(bh_plt_test PRIVATE -O0 -fno-omit-frame-pointer)
 add_test(NAME bh_plt_test COMMAND bh_plt_test)
 
+if(BH_BUILD_SHARED)
+    set(BH_INTERNAL_SOURCES "")
+    foreach(BH_SOURCE ${BH_SOURCES})
+        if(IS_ABSOLUTE "${BH_SOURCE}")
+            list(APPEND BH_INTERNAL_SOURCES "${BH_SOURCE}")
+        else()
+            list(APPEND BH_INTERNAL_SOURCES
+                "${CMAKE_CURRENT_SOURCE_DIR}/../${BH_SOURCE}")
+        endif()
+    endforeach()
+    add_library(bh_internal STATIC ${BH_INTERNAL_SOURCES})
+    target_include_directories(bh_internal PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../include
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src
+    )
+    target_compile_features(bh_internal PRIVATE c_std_11)
+    target_link_libraries(bh_internal PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
+endif()
+
 add_executable(bh_memory_test test_memory.c)
-target_link_libraries(bh_memory_test PRIVATE baaadhook)
+if(BH_BUILD_SHARED)
+    target_link_libraries(bh_memory_test PRIVATE bh_internal)
+else()
+    target_link_libraries(bh_memory_test PRIVATE baaadhook)
+endif()
 target_include_directories(bh_memory_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 target_compile_options(bh_memory_test PRIVATE -O0 -fno-omit-frame-pointer)
 add_test(NAME bh_memory_test COMMAND bh_memory_test)

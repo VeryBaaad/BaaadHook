@@ -29,6 +29,8 @@ BH_HIDDEN int bh_arch_query(bh_arch_info_t *info);
 
 BH_HIDDEN size_t bh_arch_patch_size(uintptr_t target, int thumb);
 
+BH_HIDDEN size_t bh_arch_entry_prefix(const uint8_t *bytes, size_t size);
+
 BH_HIDDEN int bh_arch_relocate(const uint8_t *src_bytes, uintptr_t src_address,
                                size_t min_bytes, int thumb,
                                void *dst, size_t dst_capacity,
@@ -59,7 +61,14 @@ BH_HIDDEN int bh__copy_code_partial(void *dst, const void *src, size_t size,
 
 BH_HIDDEN int bh__write_code(void *dst, const void *src, size_t size);
 
+BH_HIDDEN int bh__write_code_ex(void *dst, const void *src, size_t size,
+                                int preserve_bti);
+
+BH_HIDDEN int bh__page_has_bti(uintptr_t address);
+
 BH_HIDDEN int bh__write_pointer(void *address, uintptr_t value);
+BH_HIDDEN int bh__cas_pointer(void *address, uintptr_t expected,
+                              uintptr_t desired);
 
 BH_HIDDEN uintptr_t bh__read_pointer(const void *address);
 

@@ -1,0 +1,57 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  linux-debug:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
+      - run: cmake --build build -j
+      - run: ctest --test-dir build --output-on-failure
+
+  linux-shared:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DBH_BUILD_SHARED=ON
+      - run: cmake --build build -j
+      - run: ctest --test-dir build --output-on-failure
+
+  linux-asan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
+      - run: cmake --build build -j
+      - run: ctest --test-dir build --output-on-failure
+
+  cross-compile:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - arch: aarch64
+            compiler: aarch64-linux-gnu-gcc
+            package: gcc-aarch64-linux-gnu
+          - arch: armv7
+            compiler: arm-linux-gnueabihf-gcc
+            package: gcc-arm-linux-gnueabihf
+          - arch: riscv64
+            compiler: riscv64-linux-gnu-gcc
+            package: gcc-riscv64-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y ${{ matrix.package }}
+      - run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_SYSTEM_NAME=Linux
+          -DCMAKE_SYSTEM_PROCESSOR=${{ matrix.arch }}
+          -DCMAKE_C_COMPILER=${{ matrix.compiler }}
+          -DBH_BUILD_TESTS=OFF
+          -DBH_BUILD_EXAMPLES=OFF
+      - run: cmake --build build -j

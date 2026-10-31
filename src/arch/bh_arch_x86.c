@@ -28,7 +28,8 @@ enum {
     BH_X86_KIND_JMP,
     BH_X86_KIND_JCC,
     BH_X86_KIND_LOOP,
-    BH_X86_KIND_XBEGIN
+    BH_X86_KIND_XBEGIN,
+    BH_X86_KIND_RET
 };
 
 typedef struct bh_x86_insn {
@@ -134,6 +135,10 @@ static int bh_x86_decode(const uint8_t *code, int is64, bh_x86_insn_t *insn) {
 
     opcode = code[pos++];
 
+    if (is64 && (opcode == 0x62 || opcode == 0xD5)) {
+        return -1;
+    }
+
     if (opcode == 0x0F) {
         uint8_t next;
         if (pos >= BH_X86_MAX_INSN) {
@@ -160,7 +165,17 @@ static int bh_x86_decode(const uint8_t *code, int is64, bh_x86_insn_t *insn) {
                 insn->kind = BH_X86_KIND_JCC;
                 insn->condition = opcode2 & 0x0F;
             } else {
-                has_modrm = 1;
+                switch (opcode2) {
+                    case 0x05: case 0x06: case 0x07: case 0x08: case 0x09:
+                    case 0x0B: case 0x0E: case 0x30: case 0x31: case 0x32:
+                    case 0x33: case 0x34: case 0x35: case 0x37: case 0x77:
+                    case 0xA2: case 0xAA:
+                        has_modrm = 0;
+                        break;
+                    default:
+                        has_modrm = 1;
+                        break;
+                }
                 switch (opcode2) {
                     case 0x0F:
                         imm_mode = 1;
@@ -217,7 +232,7 @@ static int bh_x86_decode(const uint8_t *code, int is64, bh_x86_insn_t *insn) {
             pos += prefix_size;
             opcode2 = code[pos++];
             map = vex_map;
-            if (map == 0) {
+            if (map == 0 || map > 3) {
                 return -1;
             }
             if (map == 1 && opcode2 == 0x77) {
@@ -362,8 +377,8 @@ static int bh_x86_decode(const uint8_t *code, int is64, bh_x86_insn_t *insn) {
             case 0x5C: case 0x5D: case 0x5E: case 0x5F:
             case 0x60: case 0x61:
             case 0x6C: case 0x6D: case 0x6E: case 0x6F:
-            case 0xC3: case 0xC9:
-            case 0xCB: case 0xCC: case 0xCE: case 0xCF:
+            case 0xC9:
+            case 0xCC: case 0xCE: case 0xCF:
             case 0xD6: case 0xD7:
             case 0xEC: case 0xED: case 0xEE: case 0xEF:
             case 0xF1: case 0xF4: case 0xF5:
@@ -376,9 +391,15 @@ static int bh_x86_decode(const uint8_t *code, int is64, bh_x86_insn_t *insn) {
                 imm_mode = operand16 ? 2 : (rex_w ? 8 : 4);
                 break;
 
+            case 0xC3:
+            case 0xCB:
+                insn->kind = BH_X86_KIND_RET;
+                break;
+
             case 0xC2:
             case 0xCA:
                 imm_mode = 2;
+                insn->kind = BH_X86_KIND_RET;
                 break;
 
             case 0xC8:
@@ -518,6 +539,10 @@ static int bh_x86_scan(const uint8_t *src, size_t minimum, size_t *copied) {
         if (bh_x86_decode(src + offset, BH_X86_64, &insn) != 0) {
             return -1;
         }
+        if ((insn.kind == BH_X86_KIND_RET || insn.kind == BH_X86_KIND_JMP) &&
+            offset + insn.length < minimum) {
+            return -1;
+        }
         offset += insn.length;
     }
     *copied = offset;
@@ -549,6 +574,7 @@ static int bh_x86_emit_u32(uint8_t *dst, size_t capacity, size_t *offset,
     return bh_x86_emit_bytes(dst, capacity, offset, bytes, sizeof(bytes));
 }
 
+#if BH_X86_64
 static int bh_x86_emit_u64(uint8_t *dst, size_t capacity, size_t *offset,
                            uint64_t value) {
     uint8_t bytes[8];
@@ -558,6 +584,7 @@ static int bh_x86_emit_u64(uint8_t *dst, size_t capacity, size_t *offset,
     }
     return bh_x86_emit_bytes(dst, capacity, offset, bytes, sizeof(bytes));
 }
+#endif
 
 static int bh_x86_emit_jmp_relative(uint8_t *dst, size_t capacity, size_t *offset,
                                     uintptr_t from, uintptr_t target) {
@@ -576,8 +603,10 @@ static int bh_x86_emit_abs_jmp(uint8_t *dst, size_t capacity, size_t *offset,
     if (bh_x86_emit_bytes(dst, capacity, offset, head, sizeof(head)) != 0) return -1;
     return bh_x86_emit_u64(dst, capacity, offset, (uint64_t)target);
 #else
-    uint8_t head[2] = {0xFF, 0x25};
-    if (bh_x86_emit_bytes(dst, capacity, offset, head, sizeof(head)) != 0) return -1;
+    uint32_t literal = (uint32_t)((uintptr_t)dst + *offset + 6u);
+    if (bh_x86_emit_u8(dst, capacity, offset, 0xFF) != 0) return -1;
+    if (bh_x86_emit_u8(dst, capacity, offset, 0x25) != 0) return -1;
+    if (bh_x86_emit_u32(dst, capacity, offset, literal) != 0) return -1;
     return bh_x86_emit_u32(dst, capacity, offset, (uint32_t)target);
 #endif
 }
@@ -585,12 +614,18 @@ static int bh_x86_emit_abs_jmp(uint8_t *dst, size_t capacity, size_t *offset,
 static int bh_x86_emit_abs_call(uint8_t *dst, size_t capacity, size_t *offset,
                                 uintptr_t target) {
 #if BH_X86_64
-    uint8_t head[6] = {0xFF, 0x15, 0x00, 0x00, 0x00, 0x00};
+    uint8_t head[6] = {0xFF, 0x15, 0x02, 0x00, 0x00, 0x00};
     if (bh_x86_emit_bytes(dst, capacity, offset, head, sizeof(head)) != 0) return -1;
+    if (bh_x86_emit_u8(dst, capacity, offset, 0xEB) != 0) return -1;
+    if (bh_x86_emit_u8(dst, capacity, offset, 0x08) != 0) return -1;
     return bh_x86_emit_u64(dst, capacity, offset, (uint64_t)target);
 #else
-    uint8_t head[2] = {0xFF, 0x15};
-    if (bh_x86_emit_bytes(dst, capacity, offset, head, sizeof(head)) != 0) return -1;
+    uint32_t literal = (uint32_t)((uintptr_t)dst + *offset + 8u);
+    if (bh_x86_emit_u8(dst, capacity, offset, 0xFF) != 0) return -1;
+    if (bh_x86_emit_u8(dst, capacity, offset, 0x15) != 0) return -1;
+    if (bh_x86_emit_u32(dst, capacity, offset, literal) != 0) return -1;
+    if (bh_x86_emit_u8(dst, capacity, offset, 0xEB) != 0) return -1;
+    if (bh_x86_emit_u8(dst, capacity, offset, 0x04) != 0) return -1;
     return bh_x86_emit_u32(dst, capacity, offset, (uint32_t)target);
 #endif
 }
@@ -599,7 +634,7 @@ static size_t bh_x86_abs_jmp_size(void) {
 #if BH_X86_64
     return 14;
 #else
-    return 6;
+    return 10;
 #endif
 }
 
@@ -823,11 +858,17 @@ int bh_arch_emit_relay(void *relay, size_t capacity, const void *dest, int thumb
         buffer[0] = 0xFF;
         buffer[1] = 0x25;
         {
+            uint32_t literal =
+                (uint32_t)(uintptr_t)relay + 6u;
             uint32_t value = (uint32_t)(uintptr_t)dest;
-            buffer[2] = (uint8_t)value;
-            buffer[3] = (uint8_t)(value >> 8);
-            buffer[4] = (uint8_t)(value >> 16);
-            buffer[5] = (uint8_t)(value >> 24);
+            buffer[2] = (uint8_t)literal;
+            buffer[3] = (uint8_t)(literal >> 8);
+            buffer[4] = (uint8_t)(literal >> 16);
+            buffer[5] = (uint8_t)(literal >> 24);
+            buffer[6] = (uint8_t)value;
+            buffer[7] = (uint8_t)(value >> 8);
+            buffer[8] = (uint8_t)(value >> 16);
+            buffer[9] = (uint8_t)(value >> 24);
         }
 #endif
     }
@@ -855,6 +896,13 @@ int bh_arch_emit_patch(void *target, const void *dest, const void *relay,
     bytes[3] = (uint8_t)(displacement >> 16);
     bytes[4] = (uint8_t)(displacement >> 24);
     return 5;
+}
+
+
+size_t bh_arch_entry_prefix(const uint8_t *bytes, size_t size) {
+    (void)bytes;
+    (void)size;
+    return 0;
 }
 
 #endif /* x86 */

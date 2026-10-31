@@ -50,6 +50,8 @@ BH_API int bh_inline_unhook(void *target);
 
 BH_API int bh_inline_unhook_all(void);
 
+BH_API void bh_inline_release_trampolines(void);
+
 BH_API int bh_inline_is_hooked(const void *target);
 
 BH_API void *bh_inline_get_original(const void *target);

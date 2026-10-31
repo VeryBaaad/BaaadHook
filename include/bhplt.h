@@ -42,6 +42,10 @@ typedef enum bh_plt_status {
 BH_API int bh_plt_hook(const char *image_name, const char *symbol,
                        void *replacement, void **original);
 
+BH_API int bh_plt_hook_version(const char *image_name, const char *symbol,
+                               const char *version, void *replacement,
+                               void **original);
+
 BH_API int bh_plt_unhook(const char *image_name, const char *symbol,
                          void *replacement);
 
