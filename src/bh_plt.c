@@ -487,13 +487,20 @@ static void bh_plt_record_destroy(bh_plt_record_t *record) {
     free(record);
 }
 
-static void bh_plt_rollback(bh_plt_record_t *records) {
+static bh_plt_record_t *bh_plt_rollback(bh_plt_record_t *records) {
+    bh_plt_record_t *failed = NULL;
+
     while (records != NULL) {
         bh_plt_record_t *next = records->next;
-        (void)bh__write_pointer((void *)records->slot, records->saved_value);
-        bh_plt_record_destroy(records);
+        if (bh__write_pointer((void *)records->slot, records->saved_value) != 0) {
+            records->next = failed;
+            failed = records;
+        } else {
+            bh_plt_record_destroy(records);
+        }
         records = next;
     }
+    return failed;
 }
 
 int bh_plt_hook(const char *image_name, const char *symbol,
@@ -610,7 +617,17 @@ int bh_plt_hook(const char *image_name, const char *symbol,
     return count;
 
 rollback:
-    bh_plt_rollback(new_records);
+    {
+        bh_plt_record_t *failed = bh_plt_rollback(new_records);
+        if (failed != NULL) {
+            bh_plt_record_t *tail = failed;
+            while (tail->next != NULL) {
+                tail = tail->next;
+            }
+            tail->next = bh_plt_records;
+            bh_plt_records = failed;
+        }
+    }
     pthread_mutex_unlock(&bh_plt_lock);
     bh_plt_free_candidates(&collect);
     return result;

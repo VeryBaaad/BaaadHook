@@ -220,7 +220,7 @@ static int bh__copy_code_impl(void *dst, const void *src, size_t size,
         int prot = 0;
         int mapped;
 
-        if (current + chunk > page_end) {
+        if (chunk > page_end - current) {
             chunk = page_end - current;
         }
 
