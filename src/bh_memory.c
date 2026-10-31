@@ -98,25 +98,31 @@ size_t bh__page_size(void) {
     return value;
 }
 
-int bh__protect_query(uintptr_t address, int *prot) {
+static int bh__map_query(uintptr_t address, int *prot) {
     bh_map_entry_t *maps = NULL;
     size_t count = 0;
     const bh_map_entry_t *entry;
-    int result = -1;
+    int result = 0;
 
-    if (prot == NULL) {
-        return -1;
-    }
     if (bh__parse_maps(&maps, &count) != 0) {
         return -1;
     }
     entry = bh__find_map(maps, count, address);
     if (entry != NULL) {
-        *prot = entry->prot;
-        result = 0;
+        if (prot != NULL) {
+            *prot = entry->prot;
+        }
+        result = 1;
     }
     free(maps);
     return result;
+}
+
+int bh__protect_query(uintptr_t address, int *prot) {
+    if (prot == NULL) {
+        return -1;
+    }
+    return bh__map_query(address, prot) == 1 ? 0 : -1;
 }
 
 int bh__is_mapped_range(uintptr_t address, size_t size) {
@@ -189,14 +195,21 @@ void bh__flush_cache(void *address, size_t size) {
     }
 }
 
-int bh__copy_code(void *dst, const void *src, size_t size) {
+static int bh__copy_code_impl(void *dst, const void *src, size_t size,
+                              int allow_partial, size_t *out_copied) {
     const uint8_t *source = (const uint8_t *)src;
     uint8_t *destination = (uint8_t *)dst;
     size_t page_size = bh__page_size();
     size_t done = 0;
 
-    if ((dst == NULL) || (src == NULL) || size == 0) {
-        return size == 0 ? 0 : -1;
+    if (out_copied != NULL) {
+        *out_copied = 0;
+    }
+    if (size == 0) {
+        return 0;
+    }
+    if ((dst == NULL) || (src == NULL)) {
+        return -1;
     }
 
     while (done < size) {
@@ -205,12 +218,22 @@ int bh__copy_code(void *dst, const void *src, size_t size) {
         size_t page_end = page_start + page_size;
         size_t chunk = size - done;
         int prot = 0;
+        int mapped;
 
-        if ((uintptr_t)current + chunk > page_end) {
+        if (current + chunk > page_end) {
             chunk = page_end - current;
         }
-        if (bh__protect_query(current, &prot) != 0) {
+
+        mapped = bh__map_query(page_start, &prot);
+        if (mapped < 0) {
             return -1;
+        }
+        if (mapped == 0) {
+            if (!allow_partial) {
+                return -1;
+            }
+            memset(destination + done, 0, size - done);
+            break;
         }
         if ((prot & PROT_READ) != 0) {
             memcpy(destination + done, source + done, chunk);
@@ -223,7 +246,23 @@ int bh__copy_code(void *dst, const void *src, size_t size) {
         }
         done += chunk;
     }
+
+    if (out_copied != NULL) {
+        *out_copied = done;
+    }
     return 0;
+}
+
+int bh__copy_code(void *dst, const void *src, size_t size) {
+    return bh__copy_code_impl(dst, src, size, 0, NULL);
+}
+
+int bh__copy_code_partial(void *dst, const void *src, size_t size,
+                          size_t *copied) {
+    if (copied == NULL) {
+        return -1;
+    }
+    return bh__copy_code_impl(dst, src, size, 1, copied);
 }
 
 static void bh__restore_page_protections(uintptr_t first_page, size_t page_size,
@@ -346,13 +385,9 @@ static uintptr_t bh__align_up_ptr(uintptr_t value, size_t alignment) {
 }
 
 static int bh__mapping_within_distance(uintptr_t address, uintptr_t target,
-                                       size_t allocation_size,
                                        size_t max_distance) {
     if (address >= target) {
-        if (max_distance < allocation_size) {
-            return 0;
-        }
-        return address - target <= max_distance - allocation_size;
+        return address - target <= max_distance;
     }
     return target - address <= max_distance;
 }
@@ -376,6 +411,7 @@ void *bh__alloc_near(uintptr_t target, size_t size, size_t max_distance) {
     void *result = NULL;
     uintptr_t low_limit;
     uintptr_t high_limit;
+    uintptr_t high_limit_aligned;
 
     if (target == 0 || size == 0) {
         return NULL;
@@ -402,6 +438,7 @@ void *bh__alloc_near(uintptr_t target, size_t size, size_t max_distance) {
     if (high_limit < target) {
         high_limit = UINTPTR_MAX;
     }
+    high_limit_aligned = bh__align_down_ptr(high_limit, page_size);
 
     gaps = (bh_gap_t *)calloc(map_count + 1, sizeof(bh_gap_t));
     if (gaps == NULL) {
@@ -414,13 +451,14 @@ void *bh__alloc_near(uintptr_t target, size_t size, size_t max_distance) {
         uintptr_t gap_end;
         uintptr_t aligned_start;
         uintptr_t aligned_end;
+        uintptr_t last_start;
 
         if (i == 0) {
             gap_start = low_limit;
             gap_end = maps[0].start;
         } else if (i == map_count) {
             gap_start = maps[map_count - 1].end;
-            gap_end = high_limit;
+            gap_end = UINTPTR_MAX;
         } else {
             gap_start = maps[i - 1].end;
             gap_end = maps[i].start;
@@ -428,9 +466,6 @@ void *bh__alloc_near(uintptr_t target, size_t size, size_t max_distance) {
 
         if (gap_end <= gap_start) {
             continue;
-        }
-        if (gap_end > high_limit) {
-            gap_end = high_limit;
         }
         if (gap_start < low_limit) {
             gap_start = low_limit;
@@ -449,12 +484,20 @@ void *bh__alloc_near(uintptr_t target, size_t size, size_t max_distance) {
             continue;
         }
 
+        last_start = aligned_end - allocation_size;
+        if (last_start > high_limit_aligned) {
+            last_start = high_limit_aligned;
+        }
+        if (last_start < aligned_start) {
+            continue;
+        }
+
         gaps[gap_count].start = aligned_start;
-        gaps[gap_count].end = aligned_end;
+        gaps[gap_count].end = last_start;
         if (target < aligned_start) {
             gaps[gap_count].distance = aligned_start - target;
-        } else if (target >= aligned_end) {
-            gaps[gap_count].distance = target - aligned_end;
+        } else if (target > last_start) {
+            gaps[gap_count].distance = target - last_start;
         } else {
             gaps[gap_count].distance = 0;
         }
@@ -468,21 +511,20 @@ void *bh__alloc_near(uintptr_t target, size_t size, size_t max_distance) {
     for (i = 0; i < gap_count && i < 64; i++) {
         uintptr_t gap_start = gaps[i].start;
         uintptr_t gap_end = gaps[i].end;
-        uintptr_t last_start = gap_end - allocation_size;
         uintptr_t hint;
         uintptr_t address;
 
         if (target < gap_start) {
             hint = gap_start;
-        } else if (target >= gap_end) {
-            hint = last_start;
+        } else if (target > gap_end) {
+            hint = gap_end;
         } else {
             hint = bh__align_down_ptr(target, page_size);
             if (hint < gap_start) {
                 hint = gap_start;
             }
-            if (hint > last_start) {
-                hint = last_start;
+            if (hint > gap_end) {
+                hint = gap_end;
             }
         }
 
@@ -494,10 +536,9 @@ void *bh__alloc_near(uintptr_t target, size_t size, size_t max_distance) {
         }
 
         address = (uintptr_t)result;
-        if (address < gap_start || address > last_start ||
+        if (address < gap_start || address > gap_end ||
             (address & (uintptr_t)(page_size - 1u)) != 0 ||
-            !bh__mapping_within_distance(address, target, allocation_size,
-                                         max_distance)) {
+            !bh__mapping_within_distance(address, target, max_distance)) {
             (void)munmap(result, allocation_size);
             result = NULL;
             continue;
@@ -511,8 +552,7 @@ void *bh__alloc_near(uintptr_t target, size_t size, size_t max_distance) {
         if (result != MAP_FAILED) {
             uintptr_t address = (uintptr_t)result;
             if ((address & (uintptr_t)(page_size - 1u)) != 0 ||
-                !bh__mapping_within_distance(address, target, allocation_size,
-                                             max_distance)) {
+                !bh__mapping_within_distance(address, target, max_distance)) {
                 (void)munmap(result, allocation_size);
                 result = NULL;
             }

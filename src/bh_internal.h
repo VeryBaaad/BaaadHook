@@ -54,6 +54,9 @@ BH_HIDDEN int bh__is_executable_range(uintptr_t address, size_t size);
 
 BH_HIDDEN int bh__copy_code(void *dst, const void *src, size_t size);
 
+BH_HIDDEN int bh__copy_code_partial(void *dst, const void *src, size_t size,
+                                    size_t *copied);
+
 BH_HIDDEN int bh__write_code(void *dst, const void *src, size_t size);
 
 BH_HIDDEN int bh__write_pointer(void *address, uintptr_t value);

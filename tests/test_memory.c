@@ -102,11 +102,76 @@ static int test_alloc_near_range(void) {
     return 0;
 }
 
+static int test_copy_code_partial_boundary(void) {
+    size_t page_size = bh__page_size();
+    uint8_t *mapping;
+    uint8_t source[11];
+    uint8_t destination[32];
+    size_t copied = 0;
+    size_t i;
+
+    mapping = (uint8_t *)mmap(NULL, page_size * 2, PROT_READ | PROT_WRITE,
+                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(mapping != MAP_FAILED);
+
+    for (i = 0; i < sizeof(source); i++) {
+        source[i] = (uint8_t)(0xA0u + i);
+    }
+    memcpy(mapping + page_size - sizeof(source), source, sizeof(source));
+    CHECK(munmap(mapping + page_size, page_size) == 0);
+
+    memset(destination, 0xCC, sizeof(destination));
+    CHECK(bh__copy_code(destination, mapping + page_size - sizeof(source),
+                        sizeof(destination)) != 0);
+
+    memset(destination, 0xCC, sizeof(destination));
+    CHECK(bh__copy_code_partial(destination,
+                                mapping + page_size - sizeof(source),
+                                sizeof(destination), &copied) == 0);
+    CHECK(copied == sizeof(source));
+    CHECK(memcmp(destination, source, sizeof(source)) == 0);
+    for (i = sizeof(source); i < sizeof(destination); i++) {
+        CHECK(destination[i] == 0);
+    }
+
+    CHECK(munmap(mapping, page_size) == 0);
+    return 0;
+}
+
+static int test_alloc_near_max_distance_boundary(void) {
+    const size_t max_distance = (size_t)4 * 1024 * 1024;
+    const size_t region_size = max_distance * 5;
+    size_t page_size = bh__page_size();
+    uint8_t *region;
+    uintptr_t target;
+    uintptr_t hole;
+    void *allocation;
+
+    region = (uint8_t *)mmap(NULL, region_size, PROT_NONE,
+                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(region != MAP_FAILED);
+
+    target = (uintptr_t)region + max_distance * 2;
+    hole = (uintptr_t)region + max_distance * 3;
+    CHECK(munmap((void *)hole, page_size) == 0);
+
+    allocation = bh__alloc_near(target, page_size, max_distance);
+    CHECK(allocation != NULL);
+    CHECK((uintptr_t)allocation == hole);
+    CHECK(bh__is_mapped_range((uintptr_t)allocation, page_size));
+    CHECK(bh__free_pages(allocation, page_size) == 0);
+
+    CHECK(munmap(region, region_size) == 0);
+    return 0;
+}
+
 int main(void) {
     CHECK(test_write_code_restores_partial_pages() == 0);
     CHECK(test_write_code_across_pages() == 0);
     CHECK(test_write_pointer_restores_protection() == 0);
     CHECK(test_alloc_near_range() == 0);
+    CHECK(test_copy_code_partial_boundary() == 0);
+    CHECK(test_alloc_near_max_distance_boundary() == 0);
     puts("memory tests passed");
     return 0;
 }

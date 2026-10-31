@@ -100,6 +100,7 @@ int bh_inline_hook(void *target_argument, void *replacement, void **original) {
     size_t patch_size;
     size_t trampoline_length = 0;
     size_t copied = 0;
+    size_t prologue_size = 0;
     size_t relay_offset;
     void *relay = NULL;
     int thumb;
@@ -142,8 +143,9 @@ int bh_inline_hook(void *target_argument, void *replacement, void **original) {
         goto fail;
     }
 
-    if (bh__copy_code(original_bytes, (const void *)target_address,
-                      sizeof(original_bytes)) != 0) {
+    if (bh__copy_code_partial(original_bytes, (const void *)target_address,
+                              sizeof(original_bytes), &prologue_size) != 0 ||
+        prologue_size < patch_size) {
         status = BH_INLINE_ERROR_MEMORY_PROTECTION;
         goto fail;
     }
@@ -160,7 +162,8 @@ int bh_inline_hook(void *target_argument, void *replacement, void **original) {
         status = BH_INLINE_ERROR_UNSUPPORTED;
         goto fail;
     }
-    if (trampoline_length == 0 || copied < patch_size) {
+    if (trampoline_length == 0 || copied < patch_size ||
+        copied > prologue_size) {
         status = BH_INLINE_ERROR_UNSUPPORTED;
         goto fail;
     }

@@ -22,6 +22,11 @@ target_link_libraries(bh_concurrent_test PRIVATE baaadhook)
 target_compile_options(bh_concurrent_test PRIVATE -O0 -fno-omit-frame-pointer)
 add_test(NAME bh_concurrent_test COMMAND bh_concurrent_test)
 
+add_executable(bh_boundary_test test_boundary.c)
+target_link_libraries(bh_boundary_test PRIVATE baaadhook)
+target_compile_options(bh_boundary_test PRIVATE -O0 -fno-omit-frame-pointer)
+add_test(NAME bh_boundary_test COMMAND bh_boundary_test)
+
 if(NOT ANDROID AND CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
    CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     add_executable(bh_plt_nopie_test test_plt.c)
