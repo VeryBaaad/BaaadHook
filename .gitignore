@@ -1,0 +1,12 @@
+.temp/
+build/
+build-*/
+cmake-build-*/
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+compile_commands.json
+.cache/

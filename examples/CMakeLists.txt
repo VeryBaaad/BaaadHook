@@ -1,0 +1,5 @@
+add_executable(bh_inline_example inline_example.c)
+target_link_libraries(bh_inline_example PRIVATE baaadhook)
+
+add_executable(bh_plt_example plt_example.c)
+target_link_libraries(bh_plt_example PRIVATE baaadhook)
